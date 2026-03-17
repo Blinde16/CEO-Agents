@@ -1,0 +1,123 @@
+{
+  "name": "CEO Morning Briefing",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule — 7am Mon-Fri",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CEO_API_URL }}/webhooks/n8n/morning-briefing",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-N8N-Secret",
+              "value": "={{ $env.N8N_WEBHOOK_SECRET }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "fetch-briefing",
+      "name": "Fetch Morning Briefing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "briefings",
+        "options": {}
+      },
+      "id": "split-briefings",
+      "name": "Split — One Per Client",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.event_title }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ]
+        }
+      },
+      "id": "filter-empty",
+      "name": "Filter — Has Event",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "channel": "={{ $json.client_id }}-briefings",
+        "text": "=*Good morning!* Here is your briefing for today.\n\n*Next Meeting:* {{ $json.event_title }} at {{ $json.start_time }}\n*Attendees:* {{ $json.attendees.join(', ') }}\n\n*Context:*\n{{ $json.relationship_context }}\n\n*Open Items:*\n{{ $json.open_items.map(i => '• ' + i).join('\\n') }}\n\n*Suggested Talking Points:*\n{{ $json.suggested_talking_points.map(p => '• ' + p).join('\\n') }}",
+        "otherOptions": {}
+      },
+      "id": "slack-send",
+      "name": "Send to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [1120, 300],
+      "notes": "Configure Slack credentials and set channel name to match your client setup"
+    }
+  ],
+  "connections": {
+    "Schedule — 7am Mon-Fri": {
+      "main": [
+        [{ "node": "Fetch Morning Briefing", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Morning Briefing": {
+      "main": [
+        [{ "node": "Split — One Per Client", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split — One Per Client": {
+      "main": [
+        [{ "node": "Filter — Has Event", "type": "main", "index": 0 }]
+      ]
+    },
+    "Filter — Has Event": {
+      "main": [
+        [{ "node": "Send to Slack", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["ceo-agents", "briefing"],
+  "notes": "Runs at 7am Mon-Fri. Fetches morning briefing from the CEO-Agents API and posts to a per-client Slack channel.\n\nRequired env vars in n8n:\n  CEO_API_URL     — e.g. http://backend:8000\n  N8N_WEBHOOK_SECRET — must match N8N_WEBHOOK_SECRET in backend .env\n\nRequired credentials:\n  Slack — OAuth2 or Bot Token"
+}

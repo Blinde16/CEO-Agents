@@ -1,15 +1,18 @@
-.PHONY: dev backend frontend install install-backend install-frontend
+.PHONY: dev backend frontend install install-backend install-frontend \
+        db-migrate docker-up docker-down
 
-# One-command startup: both backend and frontend in parallel
+# ── Local dev (SQLite, no Docker) ─────────────────────────────────────────────
+
+# One-command startup: backend + frontend in parallel
 dev: install
-	@echo "Starting CEO-Agents..."
+	@echo "Starting CEO-Agents (local dev)..."
 	@trap 'kill 0' SIGINT; \
-	  (cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000) & \
+	  (cd backend && .venv/bin/alembic upgrade head && .venv/bin/uvicorn app.main:app --reload --port 8000) & \
 	  (cd frontend && npm run dev) & \
 	  wait
 
 backend:
-	cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000
+	cd backend && .venv/bin/alembic upgrade head && .venv/bin/uvicorn app.main:app --reload --port 8000
 
 frontend:
 	cd frontend && npm run dev
@@ -22,3 +25,18 @@ install-backend:
 
 install-frontend:
 	cd frontend && npm install --silent
+
+# Run Alembic migrations against DATABASE_URL (or SQLite default)
+db-migrate:
+	cd backend && .venv/bin/alembic upgrade head
+
+# ── Docker Compose (Postgres + n8n + backend + frontend) ──────────────────────
+
+docker-up:
+	docker compose up --build
+
+docker-down:
+	docker compose down
+
+docker-reset:
+	docker compose down -v

@@ -9,6 +9,7 @@ from fastapi.responses import RedirectResponse
 
 from app.action_engine import UnsupportedActionError, execute_action
 from app.approval import approval_status_for_action
+from app.database import db
 from app.integrations.google import (
     GOOGLE_SCOPES,
     GoogleIntegrationConfigError,
@@ -17,7 +18,7 @@ from app.integrations.google import (
     fetch_user_info,
 )
 from app.integrations import calendar, email
-from app.integrations.store import clear_tokens, set_tokens
+from app.integrations.store import set_tokens
 from app.intent_parser import parse_intent
 from app.llm import (
     extract_preference_from_feedback,
@@ -61,18 +62,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CLIENTS: dict[str, ClientConfig] = {}
-ACTIONS: dict[str, ActionRecord] = {}
-ACTION_LOGS: list[ActionLog] = []
-APPROVAL_QUEUE: dict[str, ApprovalRecord] = {}
-INTEGRATIONS: dict[str, dict[str, IntegrationRecord]] = {}
-GOOGLE_OAUTH_STATES: dict[str, str] = {}
-
 FINAL_APPROVAL_STATES = {
     ApprovalStatus.approved,
     ApprovalStatus.rejected,
     ApprovalStatus.expired,
 }
+
+
+# ---------------------------------------------------------------------------
+# Startup: register n8n webhook router
+# ---------------------------------------------------------------------------
+
+from app.webhooks import router as n8n_router  # noqa: E402
+app.include_router(n8n_router)
 
 
 # ---------------------------------------------------------------------------
@@ -87,21 +89,20 @@ def health() -> dict:
 @app.post("/clients", response_model=ClientConfig)
 def upsert_client(config: ClientConfig) -> ClientConfig:
     # Preserve learned preferences across upserts so they survive resets from the frontend
-    existing = CLIENTS.get(config.client_id)
+    existing = db.get_client(config.client_id)
     if existing and not config.learned_preferences and existing.learned_preferences:
         config = config.model_copy(update={"learned_preferences": existing.learned_preferences})
-    CLIENTS[config.client_id] = config
-    return config
+    return db.upsert_client(config)
 
 
 @app.get("/clients", response_model=list[ClientConfig])
 def list_clients() -> list[ClientConfig]:
-    return list(CLIENTS.values())
+    return db.list_clients()
 
 
 @app.get("/clients/{client_id}", response_model=ClientConfig)
 def get_client(client_id: str) -> ClientConfig:
-    client = CLIENTS.get(client_id)
+    client = db.get_client(client_id)
     if not client:
         raise HTTPException(status_code=404, detail="client not found")
     return client
@@ -119,7 +120,7 @@ def parse_user_intent(request: IntentRequest) -> dict:
 
 @app.post("/assistant/respond", response_model=ConversationResponse)
 async def assistant_respond(request: ConversationRequest) -> ConversationResponse:
-    client = CLIENTS.get(request.client_id)
+    client = db.get_client(request.client_id)
     if not client:
         raise HTTPException(status_code=404, detail="client not found")
 
@@ -195,14 +196,13 @@ async def assistant_respond(request: ConversationRequest) -> ConversationRespons
 
 @app.get("/briefing", response_model=MeetingBriefing)
 async def get_meeting_briefing(client_id: str, event_id: str) -> MeetingBriefing:
-    client = CLIENTS.get(client_id)
+    client = db.get_client(client_id)
     if not client:
         raise HTTPException(status_code=404, detail="client not found")
 
-    if not INTEGRATIONS.get(client_id, {}).get("google"):
+    if not db.get_integration(client_id, "google"):
         raise HTTPException(status_code=400, detail="Google not connected")
 
-    # Get the event from calendar
     events_result = calendar.list_events(client_id)
     event = next((e for e in events_result.get("events", []) if e.get("id") == event_id), None)
     if not event:
@@ -210,7 +210,6 @@ async def get_meeting_briefing(client_id: str, event_id: str) -> MeetingBriefing
 
     attendee_emails = [a for a in event.get("attendees", []) if a]
 
-    # Fetch recent emails related to attendees
     recent_emails: list[dict] = []
     for attendee_email in attendee_emails[:3]:
         name_hint = attendee_email.split("@")[0].replace(".", " ")
@@ -242,11 +241,11 @@ async def get_next_meeting_briefing(client_id: str) -> MeetingBriefing:
     generate a full meeting prep brief — no event_id required.
     This is the centerpiece of the demo: shows proactive AI-driven briefing.
     """
-    client = CLIENTS.get(client_id)
+    client = db.get_client(client_id)
     if not client:
         raise HTTPException(status_code=404, detail="client not found")
 
-    if not INTEGRATIONS.get(client_id, {}).get("google"):
+    if not db.get_integration(client_id, "google"):
         raise HTTPException(status_code=400, detail="Google not connected")
 
     events_result = calendar.list_events(client_id)
@@ -254,7 +253,6 @@ async def get_next_meeting_briefing(client_id: str) -> MeetingBriefing:
     if not upcoming:
         raise HTTPException(status_code=404, detail="no upcoming events found")
 
-    # Pick the soonest event
     event = upcoming[0]
     event_id = event.get("id", "next")
     attendee_emails = [a for a in event.get("attendees", []) if a]
@@ -289,16 +287,16 @@ async def get_next_meeting_briefing(client_id: str) -> MeetingBriefing:
 
 @app.get("/integrations", response_model=list[IntegrationRecord])
 def list_integrations(client_id: str) -> list[IntegrationRecord]:
-    return list(INTEGRATIONS.get(client_id, {}).values())
+    return list(db.get_integrations(client_id).values())
 
 
 @app.get("/integrations/google/start", response_model=IntegrationAuthStartResponse)
 def start_google_auth(client_id: str) -> IntegrationAuthStartResponse:
-    if client_id not in CLIENTS:
+    if not db.get_client(client_id):
         raise HTTPException(status_code=404, detail="client not found")
 
     state = str(uuid4())
-    GOOGLE_OAUTH_STATES[state] = client_id
+    db.put_oauth_state(state, client_id)
     try:
         auth_url = build_auth_url(client_id, state)
     except GoogleIntegrationConfigError as exc:
@@ -307,15 +305,17 @@ def start_google_auth(client_id: str) -> IntegrationAuthStartResponse:
 
 
 @app.get("/integrations/google/callback")
-async def google_auth_callback(code: str | None = None, state: str | None = None, error: str | None = None):
+async def google_auth_callback(
+    code: str | None = None, state: str | None = None, error: str | None = None
+):
     if error:
         app_base_url = get_settings().app_base_url.rstrip("/")
         return RedirectResponse(url=f"{app_base_url}?integration=google&status=error&message={error}")
 
-    if not code or not state or state not in GOOGLE_OAUTH_STATES:
+    if not code or not state or not db.has_oauth_state(state):
         raise HTTPException(status_code=400, detail="invalid oauth callback")
 
-    client_id = GOOGLE_OAUTH_STATES.pop(state)
+    client_id = db.pop_oauth_state(state)
     try:
         token_payload = await exchange_code_for_tokens(code)
         user_info = await fetch_user_info(token_payload["access_token"])
@@ -327,14 +327,18 @@ async def google_auth_callback(code: str | None = None, state: str | None = None
     token_payload["expires_at"] = (
         datetime.now(timezone.utc) + timedelta(seconds=int(token_payload.get("expires_in", 3600)))
     ).isoformat()
-    set_tokens(client_id, "google", token_payload)
-    INTEGRATIONS.setdefault(client_id, {})["google"] = IntegrationRecord(
-        client_id=client_id,
-        provider="google",
-        status="connected",
-        connected_account=user_info.get("email"),
-        scopes=GOOGLE_SCOPES,
+
+    db.save_integration(
+        IntegrationRecord(
+            client_id=client_id,
+            provider="google",
+            status="connected",
+            connected_account=user_info.get("email"),
+            scopes=GOOGLE_SCOPES,
+        ),
+        tokens=token_payload,
     )
+
     app_base_url = get_settings().app_base_url.rstrip("/")
     return RedirectResponse(url=f"{app_base_url}?integration=google&status=connected")
 
@@ -345,7 +349,7 @@ async def google_auth_callback(code: str | None = None, state: str | None = None
 
 @app.post("/actions", response_model=ActionRecord)
 def queue_or_execute_action(request: ActionRequest) -> ActionRecord:
-    client = CLIENTS.get(request.client_id)
+    client = db.get_client(request.client_id)
     if not client:
         raise HTTPException(status_code=404, detail="client not found")
 
@@ -372,47 +376,38 @@ def queue_or_execute_action(request: ActionRequest) -> ActionRecord:
         approval_status=approval_status,
         created_at=datetime.now(timezone.utc),
     )
-    ACTIONS[action_id] = action
+    db.save_action(action)
 
     if approval_status == ApprovalStatus.pending:
         approval_id = str(uuid4())
-        APPROVAL_QUEUE[approval_id] = ApprovalRecord(
+        db.save_approval(ApprovalRecord(
             approval_id=approval_id,
             action_id=action_id,
             client_id=request.client_id,
             status=ApprovalStatus.pending,
-        )
+        ))
         execution_error = None
     else:
         execution_error = _execute(action)
+        db.save_action(action)
 
     _log_action(action, execution_error)
-    return ACTIONS[action_id]
+    return db.get_action(action_id)
 
 
 @app.get("/actions", response_model=list[ActionRecord])
 def list_actions(client_id: str | None = None) -> list[ActionRecord]:
-    actions = list(ACTIONS.values())
-    if client_id:
-        actions = [action for action in actions if action.client_id == client_id]
-    return sorted(actions, key=lambda action: action.created_at, reverse=True)
+    return db.list_actions(client_id)
 
 
 @app.get("/approvals", response_model=list[ApprovalRecord])
 def list_approvals(client_id: str | None = None) -> list[ApprovalRecord]:
-    approvals = list(APPROVAL_QUEUE.values())
-    if client_id:
-        approvals = [approval for approval in approvals if approval.client_id == client_id]
-    return sorted(
-        approvals,
-        key=lambda approval: approval.decision_time or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True,
-    )
+    return db.list_approvals(client_id)
 
 
 @app.post("/approvals/decision", response_model=ApprovalRecord)
 async def decide_approval(decision: ApprovalDecision) -> ApprovalRecord:
-    approval = APPROVAL_QUEUE.get(decision.approval_id)
+    approval = db.get_approval(decision.approval_id)
     if not approval:
         raise HTTPException(status_code=404, detail="approval not found")
 
@@ -431,8 +426,12 @@ async def decide_approval(decision: ApprovalDecision) -> ApprovalRecord:
     approval.status = decision.decision
     approval.reviewer_id = decision.reviewer_id
     approval.decision_time = datetime.now(timezone.utc)
+    db.save_approval(approval)
 
-    action = ACTIONS[approval.action_id]
+    action = db.get_action(approval.action_id)
+    if not action:
+        raise HTTPException(status_code=404, detail="action not found")
+
     action.approval_status = decision.decision
     action.reviewer_id = decision.reviewer_id
     action.decision_time = approval.decision_time
@@ -443,7 +442,7 @@ async def decide_approval(decision: ApprovalDecision) -> ApprovalRecord:
         execution_error = "action not approved"
         # Preference learning: if feedback provided on rejection, extract and store a rule
         if decision.feedback and decision.feedback.strip():
-            client = CLIENTS.get(action.client_id)
+            client = db.get_client(action.client_id)
             if client:
                 try:
                     rule = await extract_preference_from_feedback(
@@ -456,33 +455,27 @@ async def decide_approval(decision: ApprovalDecision) -> ApprovalRecord:
                         updated_prefs = list(client.learned_preferences) + [
                             LearnedPreference(action_type=action.action_type, rule=rule)
                         ]
-                        CLIENTS[client.client_id] = client.model_copy(
-                            update={"learned_preferences": updated_prefs[-20:]}  # keep last 20
+                        db.upsert_client(
+                            client.model_copy(
+                                update={"learned_preferences": updated_prefs[-20:]}
+                            )
                         )
                 except Exception:
                     pass
 
+    db.save_action(action)
     _log_action(action, execution_error)
-    return approval
+    return db.get_approval(decision.approval_id)
 
 
 @app.get("/logs", response_model=list[ActionLog])
 def list_logs(client_id: str | None = None) -> list[ActionLog]:
-    logs = ACTION_LOGS
-    if client_id:
-        logs = [log for log in logs if log.client_id == client_id]
-    return sorted(logs, key=lambda log: log.timestamp, reverse=True)
+    return db.list_logs(client_id)
 
 
 @app.post("/demo/reset")
 def reset_demo() -> dict[str, str]:
-    CLIENTS.clear()
-    ACTIONS.clear()
-    ACTION_LOGS.clear()
-    APPROVAL_QUEUE.clear()
-    INTEGRATIONS.clear()
-    GOOGLE_OAUTH_STATES.clear()
-    clear_tokens()
+    db.clear_all()
     return {"status": "reset"}
 
 
@@ -504,7 +497,6 @@ def _resolve_action_type(context: ConversationContext, parsed_intent: str) -> st
 
 def _is_calendar_read_request(message: str) -> bool:
     lower = message.lower()
-    # Exact phrases
     exact = [
         "what's on my calendar", "what is on my calendar", "show my calendar", "show calendar",
         "list my calendar", "list calendar", "what do i have", "what meetings do i have",
@@ -546,7 +538,7 @@ def _is_email_read_request(message: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _calendar_read_response(client_id: str, message: str) -> ConversationResponse:
-    if INTEGRATIONS.get(client_id, {}).get("google") is None:
+    if db.get_integration(client_id, "google") is None:
         return ConversationResponse(
             state="calendar_read",
             assistant_message="Connect Google first and I can read your real calendar before making suggestions.",
@@ -593,7 +585,7 @@ def _calendar_read_response(client_id: str, message: str) -> ConversationRespons
 
 
 def _availability_response(client_id: str, message: str, client: ClientConfig) -> ConversationResponse:
-    if INTEGRATIONS.get(client_id, {}).get("google") is None:
+    if db.get_integration(client_id, "google") is None:
         return ConversationResponse(
             state="availability_read",
             assistant_message="Connect Google first and I can suggest open slots from your real calendar.",
@@ -621,7 +613,7 @@ def _availability_response(client_id: str, message: str, client: ClientConfig) -
 
 async def _email_triage_response(client_id: str, message: str, client: ClientConfig) -> ConversationResponse:
     """Fetch inbox, run LLM batch triage, and return a rich structured response."""
-    if INTEGRATIONS.get(client_id, {}).get("google") is None:
+    if db.get_integration(client_id, "google") is None:
         return ConversationResponse(
             state="email_read",
             assistant_message="Connect Google first and I can review and triage your real inbox.",
@@ -637,11 +629,9 @@ async def _email_triage_response(client_id: str, message: str, client: ClientCon
             context=ConversationContext(intent="email_read", action_type=None, collected_fields={}, missing_fields=[]),
         )
 
-    # Run LLM triage on all messages in one batch call (mini model)
     triage_results = await triage_inbox(client, messages)
 
     if not triage_results:
-        # Fallback to simple listing if LLM triage fails
         lines = []
         for m in messages[:6]:
             lines.append(f"- {m.get('subject')} from {m.get('from')}: {m.get('snippet', '')[:80]}")
@@ -651,7 +641,6 @@ async def _email_triage_response(client_id: str, message: str, client: ClientCon
             context=ConversationContext(intent="email_read", action_type=None, collected_fields={}, missing_fields=[]),
         )
 
-    # Build human-readable summary
     urgent = [r for r in triage_results if r.urgency_score >= 4]
     action_required = [r for r in triage_results if r.requires_reply and r.urgency_score < 4]
     meeting_requests = [r for r in triage_results if r.category == "meeting_request" and r.proposed_meeting_time]
@@ -664,7 +653,6 @@ async def _email_triage_response(client_id: str, message: str, client: ClientCon
     if meeting_requests:
         summary_parts.append(f"**{len(meeting_requests)} meeting request(s)** with proposed times.")
 
-    # List the top 6 by urgency
     lines = []
     for r in triage_results[:6]:
         urgency_label = "🔴" if r.urgency_score >= 4 else ("🟡" if r.urgency_score >= 3 else "⚪")
@@ -732,7 +720,6 @@ def _extract_fields(action_type: str | None, message: str, client: ClientConfig)
 
         recipient = fields.get("recipient_name")
         if isinstance(recipient, str) and recipient:
-            # Try Google Contacts first for real email resolution
             resolved_email = email.resolve_contact_email(client.client_id, recipient)
             if resolved_email:
                 fields["recipient_email"] = resolved_email
@@ -762,7 +749,6 @@ def _extract_fields(action_type: str | None, message: str, client: ClientConfig)
 
         contact = fields.get("contact_name")
         if isinstance(contact, str) and contact:
-            # Try to resolve attendee email from Contacts
             resolved = email.resolve_contact_email(client.client_id, contact)
             attendee_entry = resolved or contact
             fields["attendees"] = [attendee_entry, client.display_name or "Executive"]
@@ -807,21 +793,19 @@ async def _response_from_llm_payload(
 ) -> ConversationResponse:
     action_type = _resolve_action_type(context, str(llm_payload.get("action_type") or ""))
 
-    # If the LLM classified this as a read intent, route to real data handlers.
-    # Never let the LLM answer read requests itself — it has no access to real data.
     if action_type == "read_calendar":
         return _calendar_read_response(client.client_id, message)
     if action_type == "check_availability":
         return _availability_response(client.client_id, message, client)
     if action_type == "read_email":
         return await _email_triage_response(client.client_id, message, client)
+
     collected_fields = {**context.collected_fields}
     llm_fields = llm_payload.get("collected_fields", {})
     if isinstance(llm_fields, dict):
         collected_fields.update(llm_fields)
     collected_fields.setdefault("source_text", message)
 
-    # If the LLM gave us a recipient/contact, try to resolve their real email
     if action_type == "draft_email_reply":
         recipient = str(collected_fields.get("recipient_name", ""))
         if recipient and ("@" not in str(collected_fields.get("recipient_email", ""))
@@ -880,7 +864,7 @@ async def _response_from_llm_payload(
 
 
 async def _build_proposal(action_type: str, fields: dict, client: ClientConfig) -> DraftProposal:
-    google_connected = "google" in INTEGRATIONS.get(client.client_id, {})
+    google_connected = db.get_integration(client.client_id, "google") is not None
 
     if action_type == "draft_email_reply":
         recipient_name = str(fields.get("recipient_name", "Recipient"))
@@ -889,12 +873,10 @@ async def _build_proposal(action_type: str, fields: dict, client: ClientConfig) 
         source_text = str(fields.get("source_text", ""))
         thread_id = str(fields.get("thread_id", ""))
 
-        # Fetch thread messages for context-aware reply
         thread_messages: list[dict] = []
         if thread_id and google_connected:
             thread_messages = email.get_thread_for_message(client.client_id, thread_id)
 
-        # Generate polished draft using heavy model
         draft_result = await generate_email_draft(
             client=client,
             recipient_name=recipient_name,
@@ -965,13 +947,11 @@ async def _build_proposal(action_type: str, fields: dict, client: ClientConfig) 
         attendees = [str(attendees)]
     source_text = str(fields.get("source_text", ""))
 
-    # Smart duration inference
     from app.integrations.calendar import infer_duration_minutes, check_conflicts, check_focus_block_conflict
     duration_minutes = infer_duration_minutes(title, source_text)
 
     warnings: list[str] = []
 
-    # Conflict detection
     if google_connected and requested_time != "TBD":
         conflicts = check_conflicts(client.client_id, requested_time, duration_minutes)
         for conflict in conflicts:
@@ -979,7 +959,6 @@ async def _build_proposal(action_type: str, fields: dict, client: ClientConfig) 
                 f"Conflict: \"{conflict.get('title')}\" at {_humanize_event_time(conflict.get('start'))} overlaps this slot."
             )
 
-    # Focus block protection
     if requested_time != "TBD" and client.focus_blocks:
         focus_warning = check_focus_block_conflict(requested_time, client.focus_blocks)
         if focus_warning:
@@ -1077,7 +1056,6 @@ def _compute_open_slots(events: list[dict], working_hours: str, focus_blocks: li
         if start and end:
             normalized_events.append((start, end))
 
-    # Also block focus blocks as busy time
     if focus_blocks:
         for day_offset in range(0, 3):
             day = (now + timedelta(days=day_offset)).date()
@@ -1177,7 +1155,7 @@ def _execute(action: ActionRecord) -> str | None:
 
 
 def _log_action(action: ActionRecord, error: str | None) -> None:
-    ACTION_LOGS.append(
+    db.append_log(
         ActionLog(
             action_id=action.action_id,
             client_id=action.client_id,
