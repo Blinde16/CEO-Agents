@@ -1,0 +1,120 @@
+{
+  "name": "CEO Pre-Meeting Brief (30 min)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/5 7-19 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule — Every 5 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CEO_API_URL }}/webhooks/n8n/pre-meeting",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-N8N-Secret",
+              "value": "={{ $env.N8N_WEBHOOK_SECRET }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "fetch-pre-meeting",
+      "name": "Fetch Pre-Meeting Brief",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      },
+      "id": "filter-has-briefing",
+      "name": "Filter — Briefings Exist",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "briefings",
+        "options": {}
+      },
+      "id": "split-briefings",
+      "name": "Split — One Per Client",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "channel": "={{ $json.client_id }}-briefings",
+        "text": "=:alarm_clock: *{{ $json.minutes_until_start }}-minute warning!*\n\n*{{ $json.event_title }}* is starting soon.\n*Attendees:* {{ $json.attendees.join(', ') }}\n\n*Context:*\n{{ $json.relationship_context }}\n\n*Open Items:*\n{{ $json.open_items.map(i => '• ' + i).join('\\n') }}\n\n*Talking Points:*\n{{ $json.suggested_talking_points.map(p => '• ' + p).join('\\n') }}",
+        "otherOptions": {}
+      },
+      "id": "slack-send",
+      "name": "Send Pre-Meeting Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [1120, 300],
+      "notes": "Configure Slack credentials and set channel to match your client setup"
+    }
+  ],
+  "connections": {
+    "Schedule — Every 5 min": {
+      "main": [
+        [{ "node": "Fetch Pre-Meeting Brief", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Pre-Meeting Brief": {
+      "main": [
+        [{ "node": "Filter — Briefings Exist", "type": "main", "index": 0 }]
+      ]
+    },
+    "Filter — Briefings Exist": {
+      "main": [
+        [{ "node": "Split — One Per Client", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split — One Per Client": {
+      "main": [
+        [{ "node": "Send Pre-Meeting Alert", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["ceo-agents", "pre-meeting"],
+  "notes": "Polls every 5 minutes during business hours. When a meeting is 25-40 minutes away, sends the AI briefing to Slack.\n\nRequired env vars:\n  CEO_API_URL\n  N8N_WEBHOOK_SECRET"
+}

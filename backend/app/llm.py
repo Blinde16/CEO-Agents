@@ -260,7 +260,6 @@ Each object must have:
 Priority contacts (treat with elevated urgency): {", ".join(client.priority_contacts) or "none"}
 Executive timezone: {client.timezone}""".strip()
 
-    # Format messages compactly for the prompt
     messages_payload = [
         {
             "id": m.get("id"),
@@ -282,7 +281,6 @@ Executive timezone: {client.timezone}""".strip()
         return []
 
     raw = raw.strip()
-    # Extract JSON array
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -415,7 +413,7 @@ async def generate_briefing(
     settings = get_settings()
     if not settings.openai_api_key:
         return {
-            "relationship_context": "No LLM configured.",
+            "relationship_context": "No LLM configured — set OPENAI_API_KEY to enable briefings.",
             "open_items": [],
             "suggested_talking_points": [],
         }

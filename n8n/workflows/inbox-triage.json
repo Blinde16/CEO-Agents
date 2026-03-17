@@ -1,0 +1,135 @@
+{
+  "name": "CEO Inbox Triage (Hourly)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8-18 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule — Hourly 8am-6pm",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CEO_API_URL }}/webhooks/n8n/inbox-triage",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-N8N-Secret",
+              "value": "={{ $env.N8N_WEBHOOK_SECRET }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "fetch-triage",
+      "name": "Fetch Inbox Triage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "results",
+        "options": {}
+      },
+      "id": "split-results",
+      "name": "Split — One Per Client",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.urgent_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      },
+      "id": "filter-urgent",
+      "name": "Filter — Urgent Items Only",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "notes": "Only notify when there are urgent items. Remove this filter to always post the digest."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a Slack-formatted message for urgent items only\nconst data = $input.item.json;\nconst urgent = data.items.filter(i => i.urgency_score >= 4);\nconst lines = urgent.map(i =>\n  `:red_circle: *${i.subject}* — ${i.summary}\\n  _From: ${i.sender}_` +\n  (i.action_items?.length ? `\\n  → ${i.action_items.slice(0,2).join('; ')}` : '')\n);\nreturn [{\n  json: {\n    ...data,\n    slack_message: `*Urgent inbox items for ${data.client_name}*\\n\\n${lines.join('\\n\\n')}\\n\\n_${data.urgent_count} urgent, ${data.action_required_count} need replies_`\n  }\n}];"
+      },
+      "id": "format-message",
+      "name": "Format Slack Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "channel": "={{ $json.client_id }}-inbox",
+        "text": "={{ $json.slack_message }}",
+        "otherOptions": {}
+      },
+      "id": "slack-send",
+      "name": "Post Urgent Items to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [1340, 300]
+    }
+  ],
+  "connections": {
+    "Schedule — Hourly 8am-6pm": {
+      "main": [
+        [{ "node": "Fetch Inbox Triage", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Inbox Triage": {
+      "main": [
+        [{ "node": "Split — One Per Client", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split — One Per Client": {
+      "main": [
+        [{ "node": "Filter — Urgent Items Only", "type": "main", "index": 0 }]
+      ]
+    },
+    "Filter — Urgent Items Only": {
+      "main": [
+        [{ "node": "Format Slack Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Format Slack Message": {
+      "main": [
+        [{ "node": "Post Urgent Items to Slack", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["ceo-agents", "inbox-triage"],
+  "notes": "Runs every hour 8am-6pm Mon-Fri. Only posts to Slack if there are urgent items (urgency_score >= 4).\n\nTo always post the full digest, remove the 'Filter — Urgent Items Only' node.\n\nRequired env vars:\n  CEO_API_URL\n  N8N_WEBHOOK_SECRET"
+}

@@ -96,17 +96,21 @@ type Message = {
   text: string;
   proposal?: DraftProposal;
   triageResults?: EmailTriageResult[];
+  briefing?: MeetingBriefing;
   result?: Record<string, unknown> | null;
   emphasis?: "normal" | "success" | "warning";
 };
 
 const SUGGESTED_PROMPTS = [
+  "Prep me for my next meeting.",
   "What's on my calendar tomorrow?",
   "When am I free for a 45 minute meeting this week?",
   "Triage my inbox and summarize what needs attention.",
   "Reply to Sarah and let her know Thursday afternoon works.",
   "Schedule a 1:1 with Sarah next week about partnership planning.",
 ];
+
+const BRIEFING_PROMPT = "Prep me for my next meeting.";
 
 const demoClient: ClientConfig = {
   client_id: "acme-ceo",
@@ -281,7 +285,17 @@ function TriagePanel({
   );
 }
 
-function BriefingPanel({ briefing }: { briefing: MeetingBriefing }) {
+function BriefingPanel({
+  briefing,
+  onDraftFollowUp,
+}: {
+  briefing: MeetingBriefing;
+  onDraftFollowUp?: (prompt: string) => void;
+}) {
+  const firstAttendee = briefing.attendees[0]
+    ? briefing.attendees[0].split("@")[0].replace(".", " ")
+    : "the attendee";
+
   return (
     <div
       style={{
@@ -310,7 +324,7 @@ function BriefingPanel({ briefing }: { briefing: MeetingBriefing }) {
         </div>
       )}
       {briefing.suggested_talking_points.length > 0 && (
-        <div>
+        <div style={{ marginBottom: 10 }}>
           <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, color: "#94a3b8", marginBottom: 4 }}>
             Suggested talking points
           </div>
@@ -318,6 +332,20 @@ function BriefingPanel({ briefing }: { briefing: MeetingBriefing }) {
             {briefing.suggested_talking_points.map((pt, i) => <li key={i}>{pt}</li>)}
           </ul>
         </div>
+      )}
+      {onDraftFollowUp && (
+        <button
+          className="ghost-button"
+          type="button"
+          style={{ fontSize: 12, marginTop: 4 }}
+          onClick={() =>
+            onDraftFollowUp(
+              `Draft a follow-up email to ${firstAttendee} after our "${briefing.event_title}" meeting, summarizing next steps.`,
+            )
+          }
+        >
+          Draft follow-up email →
+        </button>
       )}
     </div>
   );
@@ -464,6 +492,19 @@ export default function HomePage() {
           text: response.assistant_message,
           proposal: response.proposal ?? undefined,
           triageResults: response.triage_results?.length ? response.triage_results : undefined,
+        });
+        return;
+      }
+
+      // Briefing prompt short-circuits directly to /briefing/next
+      if (message === BRIEFING_PROMPT) {
+        const result = await api<MeetingBriefing>(
+          `/briefing/next?client_id=${encodeURIComponent(demoClient.client_id)}`,
+        );
+        setBriefing(result);
+        pushAssistantMessage({
+          text: `Here's your pre-meeting briefing for "${result.event_title}" — ${result.start_time}.`,
+          briefing: result,
         });
         return;
       }
@@ -709,6 +750,14 @@ export default function HomePage() {
                   results={message.triageResults}
                   onBookMeeting={handleBookMeetingFromEmail}
                   onDraftReply={handleDraftReplyFromEmail}
+                />
+              )}
+
+              {/* Meeting briefing panel */}
+              {message.briefing && (
+                <BriefingPanel
+                  briefing={message.briefing}
+                  onDraftFollowUp={(prompt) => setInput(prompt)}
                 />
               )}
 

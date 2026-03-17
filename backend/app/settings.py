@@ -22,6 +22,10 @@ class Settings:
     google_client_secret: str | None
     google_redirect_uri: str
     app_base_url: str
+    # Postgres (or SQLite for local dev) — e.g. postgresql://user:pw@host/db
+    database_url: str
+    # Shared secret header sent by n8n webhooks for request verification
+    n8n_webhook_secret: str | None
 
 
 @lru_cache(maxsize=1)
@@ -32,6 +36,11 @@ def get_settings() -> Settings:
         openai_model_heavy=os.getenv("OPENAI_MODEL_HEAVY", "gpt-4.1"),
         google_client_id=os.getenv("GOOGLE_CLIENT_ID"),
         google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
-        google_redirect_uri=os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/integrations/google/callback"),
+        google_redirect_uri=os.getenv(
+            "GOOGLE_REDIRECT_URI",
+            "http://localhost:8000/integrations/google/callback",
+        ),
         app_base_url=os.getenv("APP_BASE_URL", "http://localhost:3000"),
+        database_url=os.getenv("DATABASE_URL", "sqlite:///./ceo_agents.db"),
+        n8n_webhook_secret=os.getenv("N8N_WEBHOOK_SECRET"),
     )
