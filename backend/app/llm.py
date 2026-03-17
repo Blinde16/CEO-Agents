@@ -57,6 +57,88 @@ def _parse_json_response(raw: str) -> dict | None:
     return None
 
 
+def _fallback_preference_rule(action_type: str, feedback: str) -> str | None:
+    lower = feedback.lower().strip()
+    if not lower:
+        return None
+
+    if "too formal" in lower or ("more casual" in lower):
+        return "Use casual, direct language for email replies"
+    if "bullet" in lower:
+        return "Use bullet points in email replies when summarizing next steps"
+    if "shorter" in lower or "too long" in lower:
+        return "Keep email replies short and scannable"
+    if "before 10" in lower or "before 10am" in lower or "before 10:00" in lower:
+        return "Never schedule meetings before 10:00 AM"
+    if "afternoon" in lower and action_type in {"create_event", "reschedule_event"}:
+        return "Prefer afternoon meeting times"
+    return None
+
+
+def _email_pref_flags(client: ClientConfig) -> dict[str, bool]:
+    rules = [
+        pref.rule.lower()
+        for pref in client.learned_preferences
+        if pref.action_type == "draft_email_reply"
+    ]
+    return {
+        "casual": any("casual" in rule or "direct language" in rule for rule in rules),
+        "bullets": any("bullet" in rule for rule in rules),
+        "short": any("short" in rule or "scannable" in rule or "concise" in rule for rule in rules),
+    }
+
+
+def _build_fallback_email_draft(
+    client: ClientConfig,
+    recipient_name: str,
+    topic: str,
+    thread_messages: list[dict[str, str]],
+    user_instruction: str,
+) -> dict[str, Any]:
+    flags = _email_pref_flags(client)
+    greeting = f"Hi {recipient_name}," if flags["casual"] else f"Hello {recipient_name},"
+    signoff = "Thanks," if flags["casual"] else "Best,"
+
+    thread_reference = ""
+    if thread_messages:
+        latest_subject = str(thread_messages[-1].get("subject", "")).strip()
+        if latest_subject:
+            thread_reference = f"Following up on {latest_subject}, "
+
+    if flags["bullets"]:
+        body_lines = [
+            greeting,
+            "",
+            f"{thread_reference}here is a quick update on {topic}:",
+            "- I reviewed the latest details.",
+            "- Thursday afternoon works on my side.",
+            "- Let me know if there is anything you want me to adjust.",
+            "",
+            signoff,
+            client.display_name or "Executive Office",
+        ]
+    else:
+        opener = "Quick note" if flags["casual"] else "I wanted to follow up"
+        body_lines = [
+            greeting,
+            "",
+            f"{opener} on {topic}.",
+        ]
+        if thread_reference:
+            body_lines.append(f"{thread_reference}I am aligned on the next step.")
+        else:
+            body_lines.append("I am aligned on the next step and can move this forward.")
+        if not flags["short"]:
+            body_lines.append("Let me know if you want me to adjust anything before I send it.")
+        body_lines.extend(["", signoff, client.display_name or "Executive Office"])
+
+    return {
+        "subject": f"Re: {topic.title()}",
+        "draft_body": "\n".join(body_lines),
+        "confidence": 0.72 if client.learned_preferences else 0.65,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 1. Conversational turn — used by /assistant/respond (mini model)
 # ---------------------------------------------------------------------------
@@ -76,13 +158,22 @@ async def generate_structured_response(
         learned_prefs = "\n".join(f"- {r}" for r in rules)
 
     system_prompt = f"""You are an executive assistant for {client.display_name or client.client_id}.
-You help with two categories only:
-1. Drafting an email reply
-2. Handling a calendar request (create, reschedule, cancel)
+You classify and handle requests across these categories:
+
+READ intents (you classify these; the system fetches real data — never invent data):
+- "read_calendar"  → user wants to see upcoming events, schedule, meetings, what they have on a day
+- "check_availability" → user asks when they are free, open slots, best time to meet
+- "read_email"     → user wants inbox review, triage, summary of emails
+
+WRITE intents (you collect fields and draft a proposal):
+- "draft_email_reply"  → compose a reply to an email
+- "create_event"       → book a new calendar event
+- "reschedule_event"   → move an existing event
+- "cancel_event"       → cancel an existing event
 
 Return valid JSON only — no markdown, no explanation — with this exact shape:
 {{
-  "action_type": "draft_email_reply" | "create_event" | "reschedule_event" | "cancel_event" | null,
+  "action_type": "read_calendar" | "check_availability" | "read_email" | "draft_email_reply" | "create_event" | "reschedule_event" | "cancel_event" | null,
   "assistant_message": string,
   "collected_fields": {{
     "source_text": string?,
@@ -100,13 +191,12 @@ Return valid JSON only — no markdown, no explanation — with this exact shape
   "confidence": number
 }}
 
-Rules:
-- Ask only ONE focused follow-up question when information is missing.
-- Keep assistant_message short and client-facing (no jargon).
-- If drafting email, include a polished "draft_body" in the executive's voice.
-- confidence is a float 0.0–1.0 reflecting how complete and accurate the response is.
-- Never mention JSON, payloads, APIs, or internal system names.
-- Apply these learned preferences from prior feedback:
+CRITICAL rules:
+- For read_calendar / check_availability / read_email: set state="draft_ready", leave collected_fields empty, and set assistant_message to a brief acknowledgement like "Let me check your calendar." DO NOT invent or guess any calendar events, email subjects, or inbox data.
+- Ask only ONE follow-up question when fields are missing.
+- confidence is 0.0–1.0 reflecting completeness and accuracy.
+- Never mention JSON, APIs, internal system names, or data you cannot verify.
+- Apply these learned preferences:
 {learned_prefs or "(none yet)"}
 
 Client profile:
@@ -251,7 +341,7 @@ async def generate_email_draft(
     """
     settings = get_settings()
     if not settings.openai_api_key:
-        return {"draft_body": "", "subject": f"Re: {topic}", "confidence": 0.5}
+        return _build_fallback_email_draft(client, recipient_name, topic, thread_messages, user_instruction)
 
     voice_section = ""
     if client.voice_examples:
@@ -305,7 +395,7 @@ Rules:
     )
     result = _parse_json_response(raw or "")
     if not result:
-        return {"draft_body": "", "subject": f"Re: {topic}", "confidence": 0.5}
+        return _build_fallback_email_draft(client, recipient_name, topic, thread_messages, user_instruction)
     return result
 
 
@@ -385,7 +475,7 @@ async def extract_preference_from_feedback(
     """
     settings = get_settings()
     if not settings.openai_api_key or not feedback.strip():
-        return None
+        return _fallback_preference_rule(action_type, feedback)
 
     system_prompt = """Extract a concise, reusable preference rule from the executive's feedback about a rejected draft.
 Return a single JSON object: {"rule": string} — one clear sentence that can guide future drafts.
@@ -409,6 +499,6 @@ Examples:
     )
     result = _parse_json_response(raw or "")
     if not result:
-        return None
+        return _fallback_preference_rule(action_type, feedback)
     rule = result.get("rule")
-    return str(rule) if rule else None
+    return str(rule) if rule else _fallback_preference_rule(action_type, feedback)

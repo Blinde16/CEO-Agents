@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -72,7 +72,7 @@ class ApprovalDecision(BaseModel):
 class LearnedPreference(BaseModel):
     action_type: str
     rule: str  # e.g. "never schedule before 10am with investors"
-    created_at: datetime = Field(default_factory=lambda: datetime.utcnow())
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class ClientConfig(BaseModel):

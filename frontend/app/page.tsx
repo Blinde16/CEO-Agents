@@ -333,6 +333,7 @@ export default function HomePage() {
   ]);
   const [context, setContext] = useState<ConversationContext | null>(null);
   const [pendingProposal, setPendingProposal] = useState<DraftProposal | null>(null);
+  const [revisionProposal, setRevisionProposal] = useState<DraftProposal | null>(null);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -415,6 +416,58 @@ export default function HomePage() {
     setBriefing(null);
 
     try {
+      if (revisionProposal) {
+        const originalPrompt = String(revisionProposal.payload.source_text ?? "").trim();
+        const revisionAction = await api<ActionRecord>("/actions", {
+          method: "POST",
+          body: JSON.stringify({
+            client_id: demoClient.client_id,
+            user_id: DEMO_USER_ID,
+            action_type: revisionProposal.action_type,
+            payload: revisionProposal.payload,
+          }),
+        });
+
+        if (revisionAction.approval_status === "pending") {
+          const approvals = await api<ApprovalRecord[]>(`/approvals?client_id=${encodeURIComponent(demoClient.client_id)}`);
+          const matchingApproval = approvals.find(
+            (approval) => approval.action_id === revisionAction.action_id && approval.status === "pending",
+          );
+
+          if (matchingApproval) {
+            await api<ApprovalRecord>("/approvals/decision", {
+              method: "POST",
+              body: JSON.stringify({
+                approval_id: matchingApproval.approval_id,
+                reviewer_id: DEMO_USER_ID,
+                decision: "rejected",
+                feedback: message,
+              }),
+            });
+          }
+        }
+
+        const response = await api<ConversationResponse>("/assistant/respond", {
+          method: "POST",
+          body: JSON.stringify({
+            client_id: demoClient.client_id,
+            user_id: DEMO_USER_ID,
+            message: originalPrompt || String(revisionProposal.title),
+            context: null,
+          }),
+        });
+
+        setContext(response.context);
+        setPendingProposal(response.proposal ?? null);
+        setRevisionProposal(null);
+        pushAssistantMessage({
+          text: response.assistant_message,
+          proposal: response.proposal ?? undefined,
+          triageResults: response.triage_results?.length ? response.triage_results : undefined,
+        });
+        return;
+      }
+
       const response = await api<ConversationResponse>("/assistant/respond", {
         method: "POST",
         body: JSON.stringify({
@@ -499,6 +552,7 @@ export default function HomePage() {
         emphasis: finalAction.result?.error ? "warning" : "success",
       });
       setPendingProposal(null);
+      setRevisionProposal(null);
       setContext(null);
     } catch (approvalError) {
       setError(approvalError instanceof Error ? approvalError.message : "Failed to approve draft.");
@@ -509,10 +563,12 @@ export default function HomePage() {
 
   function handleRevise() {
     if (!pendingProposal) return;
-    pushAssistantMessage({
-      text: "Tell me what you want changed and I'll revise the draft. You can also add feedback — I'll remember it for next time.",
-    });
+    setRevisionProposal(pendingProposal);
+    setContext(null);
     setPendingProposal(null);
+    pushAssistantMessage({
+      text: "Tell me what you want changed and I'll revise the draft. Your feedback will be stored as a preference for the next version.",
+    });
   }
 
   async function handleReset() {
@@ -537,6 +593,7 @@ export default function HomePage() {
       }]);
       setContext(null);
       setPendingProposal(null);
+      setRevisionProposal(null);
       setBriefing(null);
       setInput("");
       setClientReady(true);

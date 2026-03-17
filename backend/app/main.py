@@ -442,23 +442,31 @@ def reset_demo() -> dict[str, str]:
 # Private helpers — intent routing
 # ---------------------------------------------------------------------------
 
+_READ_INTENTS = {"read_calendar", "check_availability", "read_email"}
+_WRITE_INTENTS = {"draft_email_reply", "create_event", "reschedule_event", "cancel_event"}
+
+
 def _resolve_action_type(context: ConversationContext, parsed_intent: str) -> str | None:
-    if parsed_intent in {"draft_email_reply", "create_event", "reschedule_event", "cancel_event"}:
+    if parsed_intent in _WRITE_INTENTS | _READ_INTENTS:
         return parsed_intent
-    if context.action_type in {"draft_email_reply", "create_event", "reschedule_event", "cancel_event"}:
+    if context.action_type in _WRITE_INTENTS:
         return context.action_type
     return None
 
 
 def _is_calendar_read_request(message: str) -> bool:
     lower = message.lower()
-    read_phrases = [
+    # Exact phrases
+    exact = [
         "what's on my calendar", "what is on my calendar", "show my calendar", "show calendar",
         "list my calendar", "list calendar", "what do i have", "what meetings do i have",
         "what events do i have", "show my events", "show my schedule", "what is my schedule",
-        "what's my schedule",
+        "what's my schedule", "what's on my schedule", "my calendar", "my schedule",
+        "what do i have today", "what do i have tomorrow", "what do i have this week",
+        "what's happening", "what's coming up", "what meetings", "my meetings",
+        "am i busy", "do i have anything", "do i have a meeting", "what does my",
     ]
-    return any(phrase in lower for phrase in read_phrases)
+    return any(phrase in lower for phrase in exact)
 
 
 def _is_availability_request(message: str) -> bool:
@@ -466,6 +474,8 @@ def _is_availability_request(message: str) -> bool:
     availability_phrases = [
         "when am i free", "when do i have time", "find time", "find a time",
         "best time", "open slot", "available slot", "availability", "when can i meet",
+        "free time", "free slot", "when are you free", "when would work",
+        "open window", "open time", "gap in my calendar",
     ]
     return any(phrase in lower for phrase in availability_phrases)
 
@@ -476,7 +486,9 @@ def _is_email_read_request(message: str) -> bool:
         "review my inbox", "review inbox", "show my inbox", "show inbox",
         "what emails do i have", "what's in my inbox", "what is in my inbox",
         "summarize my inbox", "categorize my inbox", "triage my inbox",
-        "check my email", "check my inbox", "what email",
+        "check my email", "check my inbox", "what email", "my inbox",
+        "any emails", "new emails", "unread emails", "important emails",
+        "what messages", "check messages",
     ]
     return any(phrase in lower for phrase in read_phrases)
 
@@ -746,6 +758,15 @@ async def _response_from_llm_payload(
     llm_payload: dict,
 ) -> ConversationResponse:
     action_type = _resolve_action_type(context, str(llm_payload.get("action_type") or ""))
+
+    # If the LLM classified this as a read intent, route to real data handlers.
+    # Never let the LLM answer read requests itself — it has no access to real data.
+    if action_type == "read_calendar":
+        return _calendar_read_response(client.client_id, message)
+    if action_type == "check_availability":
+        return _availability_response(client.client_id, message, client)
+    if action_type == "read_email":
+        return await _email_triage_response(client.client_id, message, client)
     collected_fields = {**context.collected_fields}
     llm_fields = llm_payload.get("collected_fields", {})
     if isinstance(llm_fields, dict):
