@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+import app.main as main_module
 from app.main import ACTIONS, ACTION_LOGS, APPROVAL_QUEUE, CLIENTS, app
 from app.schemas import ActionStatus, ApprovalStatus
 
@@ -250,3 +251,123 @@ def test_email_read_request_requires_connected_google() -> None:
     body = response.json()
     assert body["state"] == "email_read"
     assert "Connect Google first" in body["assistant_message"]
+
+
+def test_rejection_feedback_stores_preference_rule(monkeypatch) -> None:
+    async def fake_extract_preference(*args, **kwargs) -> str:
+        return "Use casual, direct language for email replies"
+
+    monkeypatch.setattr(main_module, "extract_preference_from_feedback", fake_extract_preference)
+
+    create_client()
+    draft_response = client.post(
+        "/assistant/respond",
+        json={
+            "client_id": "c1",
+            "user_id": "u1",
+            "message": "Reply to John about the contract renewal",
+            "context": None,
+        },
+    )
+    assert draft_response.status_code == 200
+    proposal = draft_response.json()["proposal"]
+
+    action_response = client.post(
+        "/actions",
+        json={
+            "client_id": "c1",
+            "user_id": "u1",
+            "action_type": proposal["action_type"],
+            "payload": proposal["payload"],
+        },
+    )
+    assert action_response.status_code == 200
+    approval_id = client.get("/approvals").json()[0]["approval_id"]
+
+    reject_response = client.post(
+        "/approvals/decision",
+        json={
+            "approval_id": approval_id,
+            "reviewer_id": "reviewer-1",
+            "decision": ApprovalStatus.rejected,
+            "feedback": "too formal",
+        },
+    )
+    assert reject_response.status_code == 200
+    assert CLIENTS["c1"].learned_preferences[-1].rule == "Use casual, direct language for email replies"
+
+
+def test_rejected_feedback_changes_next_fallback_email_draft(monkeypatch) -> None:
+    async def fake_structured_response(*args, **kwargs):
+        return None
+
+    async def fake_extract_preference(*args, **kwargs) -> str:
+        return "Use casual, direct language for email replies"
+
+    async def fake_generate_email_draft(client, recipient_name, topic, thread_messages, user_instruction):
+        greeting = "Hi" if client.learned_preferences else "Hello"
+        return {
+            "subject": f"Re: {topic.title()}",
+            "draft_body": f"{greeting} {recipient_name},\n\nFollowing up on {topic}.\n\nBest,\nAcme Executive Office",
+            "confidence": 0.8,
+        }
+
+    monkeypatch.setattr(main_module, "generate_structured_response", fake_structured_response)
+    monkeypatch.setattr(main_module, "extract_preference_from_feedback", fake_extract_preference)
+    monkeypatch.setattr(main_module, "generate_email_draft", fake_generate_email_draft)
+
+    create_client()
+    initial_response = client.post(
+        "/assistant/respond",
+        json={
+            "client_id": "c1",
+            "user_id": "u1",
+            "message": "Reply to John about the contract renewal",
+            "context": None,
+        },
+    )
+    assert initial_response.status_code == 200
+    initial_proposal = initial_response.json()["proposal"]
+    initial_draft = next(
+        detail["value"] for detail in initial_proposal["details"] if detail["label"] == "Draft"
+    )
+    assert initial_draft.startswith("Hello John,")
+
+    action_response = client.post(
+        "/actions",
+        json={
+            "client_id": "c1",
+            "user_id": "u1",
+            "action_type": initial_proposal["action_type"],
+            "payload": initial_proposal["payload"],
+        },
+    )
+    assert action_response.status_code == 200
+    approval_id = client.get("/approvals").json()[0]["approval_id"]
+
+    reject_response = client.post(
+        "/approvals/decision",
+        json={
+            "approval_id": approval_id,
+            "reviewer_id": "reviewer-1",
+            "decision": ApprovalStatus.rejected,
+            "feedback": "too formal",
+        },
+    )
+    assert reject_response.status_code == 200
+
+    revised_response = client.post(
+        "/assistant/respond",
+        json={
+            "client_id": "c1",
+            "user_id": "u1",
+            "message": "Reply to John about the contract renewal",
+            "context": None,
+        },
+    )
+    assert revised_response.status_code == 200
+    revised_proposal = revised_response.json()["proposal"]
+    revised_draft = next(
+        detail["value"] for detail in revised_proposal["details"] if detail["label"] == "Draft"
+    )
+    assert revised_draft.startswith("Hi John,")
