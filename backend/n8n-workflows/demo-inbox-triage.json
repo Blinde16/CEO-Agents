@@ -1,0 +1,140 @@
+{
+  "name": "Demo - Inbox Triage",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/webhooks/n8n/inbox-triage",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-N8N-Secret",
+              "value": "change-me-to-a-random-secret"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "fetch-triage",
+      "name": "Fetch Inbox Triage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.client_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      },
+      "id": "has-results",
+      "name": "Has Triage Results?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [700, 300]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "results",
+        "options": {}
+      },
+      "id": "split-results",
+      "name": "Split Results",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [920, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.item.json;\nconst lines = (data.items || []).slice(0, 5).map(i => {\n  const actionText = (i.action_items || []).length ? ` | Actions: ${i.action_items.join('; ')}` : '';\n  return `- [${i.urgency_score}] ${i.subject} | ${i.sender} | ${i.summary}${actionText}`;\n});\nreturn [{\n  json: {\n    ...data,\n    preview_message:\n      `Inbox triage for ${data.client_name}\\n\\n` +\n      `Urgent: ${data.urgent_count}\\n` +\n      `Action required: ${data.action_required_count}\\n` +\n      `Meeting requests: ${data.meeting_request_count}\\n\\n` +\n      `${lines.length ? lines.join('\\n') : '- no items'}`\n  }\n}];"
+      },
+      "id": "format-preview",
+      "name": "Format Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1140, 300]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Inbox Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Inbox Triage": {
+      "main": [
+        [
+          {
+            "node": "Has Triage Results?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Triage Results?": {
+      "main": [
+        [
+          {
+            "node": "Split Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Results": {
+      "main": [
+        [
+          {
+            "node": "Format Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "demo-inbox-triage-v1",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": [
+    {
+      "name": "ceo-agents"
+    },
+    {
+      "name": "demo"
+    }
+  ]
+}

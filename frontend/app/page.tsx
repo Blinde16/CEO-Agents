@@ -134,6 +134,16 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const body = await response.text();
+    let parsedDetail: string | null = null;
+    try {
+      const parsed = JSON.parse(body) as { detail?: string };
+      parsedDetail = parsed?.detail ?? null;
+    } catch {
+      // Fall through to raw body handling when the response is not JSON.
+    }
+    if (parsedDetail) {
+      throw new Error(parsedDetail);
+    }
     throw new Error(body || `Request failed: ${response.status}`);
   }
 

@@ -1,0 +1,140 @@
+{
+  "name": "Demo - Morning Briefing",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/webhooks/n8n/morning-briefing",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-N8N-Secret",
+              "value": "change-me-to-a-random-secret"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "fetch-briefing",
+      "name": "Fetch Morning Briefing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      },
+      "id": "has-results",
+      "name": "Has Briefings?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [700, 300]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "briefings",
+        "options": {}
+      },
+      "id": "split-briefings",
+      "name": "Split Briefings",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [920, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.item.json;\nconst bullets = (values = []) => values.length ? values.map(v => `- ${v}`).join('\\n') : '- none';\nreturn [{\n  json: {\n    ...item,\n    preview_message:\n      `Morning briefing for ${item.client_name}\\n\\n` +\n      `Meeting: ${item.event_title}\\n` +\n      `Start: ${item.start_time}\\n` +\n      `Attendees: ${(item.attendees || []).join(', ') || 'none'}\\n\\n` +\n      `Context:\\n${item.relationship_context || 'none'}\\n\\n` +\n      `Open items:\\n${bullets(item.open_items)}\\n\\n` +\n      `Talking points:\\n${bullets(item.suggested_talking_points)}`\n  }\n}];"
+      },
+      "id": "format-preview",
+      "name": "Format Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1140, 300]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Morning Briefing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Morning Briefing": {
+      "main": [
+        [
+          {
+            "node": "Has Briefings?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Briefings?": {
+      "main": [
+        [
+          {
+            "node": "Split Briefings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Briefings": {
+      "main": [
+        [
+          {
+            "node": "Format Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "demo-morning-briefing-v1",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": [
+    {
+      "name": "ceo-agents"
+    },
+    {
+      "name": "demo"
+    }
+  ]
+}

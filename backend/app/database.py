@@ -140,7 +140,18 @@ class Database:
         kwargs: dict = {"pool_pre_ping": True}
         if url.startswith("sqlite"):
             kwargs["connect_args"] = {"check_same_thread": False}
-        return create_engine(url, **kwargs)
+        try:
+            return create_engine(url, **kwargs)
+        except ModuleNotFoundError as exc:
+            # Demo fallback: if the configured Postgres driver is unavailable in the
+            # local venv, keep the app usable with SQLite instead of failing startup.
+            if "psycopg2" not in str(exc) or url.startswith("sqlite"):
+                raise
+            return create_engine(
+                "sqlite:///./ceo_agents.db",
+                pool_pre_ping=True,
+                connect_args={"check_same_thread": False},
+            )
 
     @contextmanager
     def _session(self) -> Generator[Session, None, None]:
@@ -169,7 +180,8 @@ class Database:
             row.approval_rules = config.approval_rules
             row.priority_contacts = config.priority_contacts
             row.voice_examples = config.voice_examples
-            row.learned_preferences = [p.model_dump() for p in config.learned_preferences]
+            # Store JSON-safe values because the column is persisted as JSON.
+            row.learned_preferences = [p.model_dump(mode="json") for p in config.learned_preferences]
             row.focus_blocks = config.focus_blocks
             s.commit()
             s.refresh(row)

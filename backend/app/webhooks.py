@@ -48,6 +48,10 @@ def _parse_event_dt(value: object) -> datetime | None:
         return None
 
 
+def _client_error(client_id: str, exc: Exception) -> dict[str, str]:
+    return {"client_id": client_id, "error": str(exc)}
+
+
 async def _build_briefing_payload(client_id: str) -> dict | None:
     """
     Fetch the next upcoming event for a client, pull relevant emails, and
@@ -121,15 +125,21 @@ async def morning_briefing(x_n8n_secret: str | None = Header(None)) -> dict:
     _verify_secret(x_n8n_secret)
 
     briefings = []
+    errors = []
     for client in db.list_clients():
-        payload = await _build_briefing_payload(client.client_id)
-        if payload:
-            briefings.append(payload)
+        try:
+            payload = await _build_briefing_payload(client.client_id)
+            if payload:
+                briefings.append(payload)
+        except Exception as exc:
+            errors.append(_client_error(client.client_id, exc))
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "briefings": briefings,
         "count": len(briefings),
+        "error_count": len(errors),
+        "errors": errors,
     }
 
 
@@ -161,46 +171,52 @@ async def pre_meeting_brief(x_n8n_secret: str | None = Header(None)) -> dict:
     window_end = now + timedelta(minutes=40)
 
     briefings = []
+    errors = []
     for client in db.list_clients():
-        if not db.get_integration(client.client_id, "google"):
-            continue
-
-        events_result = calendar.list_events(client.client_id)
-        for event in events_result.get("events", []):
-            start_dt = _parse_event_dt(event.get("start"))
-            if start_dt is None:
-                continue
-            if not (window_start <= start_dt <= window_end):
+        try:
+            if not db.get_integration(client.client_id, "google"):
                 continue
 
-            attendee_emails = [a for a in event.get("attendees", []) if a]
-            recent_emails: list[dict] = []
-            for ae in attendee_emails[:3]:
-                name_hint = ae.split("@")[0].replace(".", " ")
-                msg = email.find_message_for_contact(client.client_id, name_hint)
-                if msg:
-                    recent_emails.append(msg)
+            events_result = calendar.list_events(client.client_id)
+            for event in events_result.get("events", []):
+                start_dt = _parse_event_dt(event.get("start"))
+                if start_dt is None:
+                    continue
+                if not (window_start <= start_dt <= window_end):
+                    continue
 
-            briefing_data = await generate_briefing(client, event, recent_emails)
-            minutes_until = int((start_dt - now).total_seconds() / 60)
+                attendee_emails = [a for a in event.get("attendees", []) if a]
+                recent_emails: list[dict] = []
+                for ae in attendee_emails[:3]:
+                    name_hint = ae.split("@")[0].replace(".", " ")
+                    msg = email.find_message_for_contact(client.client_id, name_hint)
+                    if msg:
+                        recent_emails.append(msg)
 
-            briefings.append({
-                "client_id": client.client_id,
-                "client_name": client.display_name or client.client_id,
-                "event_id": event.get("id", ""),
-                "event_title": event.get("title", "Meeting"),
-                "start_time": start_dt.isoformat(),
-                "minutes_until_start": minutes_until,
-                "attendees": attendee_emails,
-                "relationship_context": briefing_data.get("relationship_context", ""),
-                "open_items": briefing_data.get("open_items", []),
-                "suggested_talking_points": briefing_data.get("suggested_talking_points", []),
-            })
+                briefing_data = await generate_briefing(client, event, recent_emails)
+                minutes_until = int((start_dt - now).total_seconds() / 60)
+
+                briefings.append({
+                    "client_id": client.client_id,
+                    "client_name": client.display_name or client.client_id,
+                    "event_id": event.get("id", ""),
+                    "event_title": event.get("title", "Meeting"),
+                    "start_time": start_dt.isoformat(),
+                    "minutes_until_start": minutes_until,
+                    "attendees": attendee_emails,
+                    "relationship_context": briefing_data.get("relationship_context", ""),
+                    "open_items": briefing_data.get("open_items", []),
+                    "suggested_talking_points": briefing_data.get("suggested_talking_points", []),
+                })
+        except Exception as exc:
+            errors.append(_client_error(client.client_id, exc))
 
     return {
         "checked_at": now.isoformat(),
         "briefings": briefings,
         "count": len(briefings),
+        "error_count": len(errors),
+        "errors": errors,
     }
 
 
@@ -234,51 +250,57 @@ async def inbox_triage(x_n8n_secret: str | None = Header(None)) -> dict:
     _verify_secret(x_n8n_secret)
 
     results = []
+    errors = []
     for client in db.list_clients():
-        if not db.get_integration(client.client_id, "google"):
-            continue
+        try:
+            if not db.get_integration(client.client_id, "google"):
+                continue
 
-        messages_result = email.list_messages(client.client_id)
-        messages = messages_result.get("messages", [])
-        if not messages:
-            continue
+            messages_result = email.list_messages(client.client_id)
+            messages = messages_result.get("messages", [])
+            if not messages:
+                continue
 
-        triage_items = await triage_inbox(client, messages)
-        if not triage_items:
-            continue
+            triage_items = await triage_inbox(client, messages)
+            if not triage_items:
+                continue
 
-        urgent = [r for r in triage_items if r.urgency_score >= 4]
-        action_required = [r for r in triage_items if r.requires_reply and r.urgency_score < 4]
-        meeting_requests = [
-            r for r in triage_items
-            if r.category == "meeting_request" and r.proposed_meeting_time
-        ]
+            urgent = [r for r in triage_items if r.urgency_score >= 4]
+            action_required = [r for r in triage_items if r.requires_reply and r.urgency_score < 4]
+            meeting_requests = [
+                r for r in triage_items
+                if r.category == "meeting_request" and r.proposed_meeting_time
+            ]
 
-        results.append({
-            "client_id": client.client_id,
-            "client_name": client.display_name or client.client_id,
-            "urgent_count": len(urgent),
-            "action_required_count": len(action_required),
-            "meeting_request_count": len(meeting_requests),
-            "items": [
-                {
-                    "message_id": r.message_id,
-                    "subject": r.subject,
-                    "sender": r.sender,
-                    "category": r.category,
-                    "urgency_score": r.urgency_score,
-                    "summary": r.summary,
-                    "action_items": r.action_items,
-                    "requires_reply": r.requires_reply,
-                    "reply_deadline": r.reply_deadline,
-                    "proposed_meeting_time": r.proposed_meeting_time,
-                }
-                for r in triage_items[:10]
-            ],
-        })
+            results.append({
+                "client_id": client.client_id,
+                "client_name": client.display_name or client.client_id,
+                "urgent_count": len(urgent),
+                "action_required_count": len(action_required),
+                "meeting_request_count": len(meeting_requests),
+                "items": [
+                    {
+                        "message_id": r.message_id,
+                        "subject": r.subject,
+                        "sender": r.sender,
+                        "category": r.category,
+                        "urgency_score": r.urgency_score,
+                        "summary": r.summary,
+                        "action_items": r.action_items,
+                        "requires_reply": r.requires_reply,
+                        "reply_deadline": r.reply_deadline,
+                        "proposed_meeting_time": r.proposed_meeting_time,
+                    }
+                    for r in triage_items[:10]
+                ],
+            })
+        except Exception as exc:
+            errors.append(_client_error(client.client_id, exc))
 
     return {
         "triaged_at": datetime.now(timezone.utc).isoformat(),
         "results": results,
         "client_count": len(results),
+        "error_count": len(errors),
+        "errors": errors,
     }

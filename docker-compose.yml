@@ -33,12 +33,14 @@ services:
   n8n:
     image: n8nio/n8n:latest
     restart: unless-stopped
+    env_file:
+      - ./backend/.env
     environment:
       N8N_HOST: localhost
       N8N_PORT: 5678
       N8N_PROTOCOL: http
       WEBHOOK_URL: http://localhost:5678/
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-change-me-in-production}
+      CEO_API_URL: http://backend:8000
       # Pre-load workflow templates from the n8n/workflows directory
       N8N_IMPORT_WORKFLOW: /home/node/.n8n/import
     ports:
@@ -55,16 +57,14 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
+    env_file:
+      - ./backend/.env
     environment:
       DATABASE_URL: postgresql://ceo:${POSTGRES_PASSWORD:-ceopassword}@postgres:5432/ceo_agents
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
       OPENAI_MODEL_HEAVY: ${OPENAI_MODEL_HEAVY:-gpt-4.1}
-      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
-      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
-      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/integrations/google/callback}
-      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:3000}
-      N8N_WEBHOOK_SECRET: ${N8N_WEBHOOK_SECRET}
+      GOOGLE_REDIRECT_URI: http://localhost:8000/integrations/google/callback
+      APP_BASE_URL: http://localhost:3000
     ports:
       - "8000:8000"
     depends_on:

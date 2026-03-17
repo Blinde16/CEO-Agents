@@ -1,33 +1,51 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
 from fastapi.testclient import TestClient
 
 import app.main as main_module
-from app.main import ACTIONS, ACTION_LOGS, APPROVAL_QUEUE, CLIENTS, app
-from app.schemas import ActionStatus, ApprovalStatus
+import app.webhooks as webhooks_module
+from app.database import db
+from app.schemas import ActionStatus, ApprovalStatus, IntegrationRecord
 
-client = TestClient(app)
+client = TestClient(main_module.app)
 
 
 def setup_function() -> None:
-    CLIENTS.clear()
-    ACTIONS.clear()
-    APPROVAL_QUEUE.clear()
-    ACTION_LOGS.clear()
+    db.clear_all()
 
 
-def create_client() -> None:
+def create_client(client_id: str = "c1") -> None:
     response = client.post(
         "/clients",
         json={
-            "client_id": "c1",
+            "client_id": client_id,
             "display_name": "Acme Executive Office",
             "timezone": "America/Denver",
             "working_hours": "08:00-17:00",
             "scheduling_preferences": {},
             "approval_rules": {},
             "priority_contacts": ["Sarah"],
+            "voice_examples": [],
+            "learned_preferences": [],
+            "focus_blocks": [],
         },
     )
     assert response.status_code == 200
+
+
+def connect_google(client_id: str = "c1") -> None:
+    db.save_integration(
+        IntegrationRecord(
+            client_id=client_id,
+            provider="google",
+            status="connected",
+            connected_account=f"{client_id}@example.com",
+            scopes=["gmail.readonly", "calendar.readonly"],
+        ),
+        tokens={"access_token": "token", "expires_at": "2099-01-01T00:00:00+00:00"},
+    )
 
 
 def test_actions_requiring_approval_are_queued_then_executed_after_approval() -> None:
@@ -43,8 +61,8 @@ def test_actions_requiring_approval_are_queued_then_executed_after_approval() ->
     )
     assert response.status_code == 200
     action = response.json()
-    assert action["status"] == ActionStatus.queued
-    assert action["approval_status"] == ApprovalStatus.pending
+    assert action["status"] == ActionStatus.queued.value
+    assert action["approval_status"] == ApprovalStatus.pending.value
 
     approvals = client.get("/approvals")
     assert approvals.status_code == 200
@@ -55,14 +73,16 @@ def test_actions_requiring_approval_are_queued_then_executed_after_approval() ->
         json={
             "approval_id": approval_id,
             "reviewer_id": "reviewer-1",
-            "decision": ApprovalStatus.approved,
+            "decision": ApprovalStatus.approved.value,
         },
     )
     assert approve_response.status_code == 200
 
-    updated_action = ACTIONS[action["action_id"]]
+    updated_action = db.get_action(action["action_id"])
+    assert updated_action is not None
     assert updated_action.status == ActionStatus.executed
     assert updated_action.approval_status == ApprovalStatus.approved
+    assert updated_action.result is not None
     assert updated_action.result["provider"] == "email"
 
 
@@ -86,7 +106,7 @@ def test_approval_decision_is_idempotent_for_same_final_state() -> None:
         json={
             "approval_id": approval_id,
             "reviewer_id": "reviewer-1",
-            "decision": ApprovalStatus.rejected,
+            "decision": ApprovalStatus.rejected.value,
         },
     )
     assert first_decision.status_code == 200
@@ -96,12 +116,10 @@ def test_approval_decision_is_idempotent_for_same_final_state() -> None:
         json={
             "approval_id": approval_id,
             "reviewer_id": "reviewer-2",
-            "decision": ApprovalStatus.rejected,
+            "decision": ApprovalStatus.rejected.value,
         },
     )
     assert second_decision.status_code == 200
-
-    # Replay does not mutate finalized metadata.
     assert second_decision.json()["reviewer_id"] == "reviewer-1"
 
 
@@ -125,7 +143,7 @@ def test_approval_decision_rejects_conflicting_final_state_transition() -> None:
         json={
             "approval_id": approval_id,
             "reviewer_id": "reviewer-1",
-            "decision": ApprovalStatus.rejected,
+            "decision": ApprovalStatus.rejected.value,
         },
     )
     assert first_decision.status_code == 200
@@ -135,7 +153,7 @@ def test_approval_decision_rejects_conflicting_final_state_transition() -> None:
         json={
             "approval_id": approval_id,
             "reviewer_id": "reviewer-2",
-            "decision": ApprovalStatus.approved,
+            "decision": ApprovalStatus.approved.value,
         },
     )
     assert conflicting_decision.status_code == 409
@@ -200,6 +218,29 @@ def test_assistant_builds_email_draft_after_follow_up() -> None:
     assert body["state"] == "draft_ready"
     assert body["proposal"]["kind"] == "email"
     assert body["proposal"]["title"] == "Draft reply to Sarah"
+
+
+def test_assistant_extracts_email_recipient_and_topic_from_natural_request(monkeypatch) -> None:
+    async def no_llm(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main_module, "generate_structured_response", no_llm)
+
+    create_client()
+    response = client.post(
+        "/assistant/respond",
+        json={
+            "client_id": "c1",
+            "user_id": "u1",
+            "message": "Reply to Sarah and let her know Thursday afternoon works.",
+            "context": None,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "draft_ready"
+    assert body["proposal"]["title"] == "Draft reply to Sarah"
+    assert body["proposal"]["payload"]["topic"] == "Thursday afternoon works"
 
 
 def test_calendar_read_request_requires_connected_google() -> None:
@@ -289,12 +330,15 @@ def test_rejection_feedback_stores_preference_rule(monkeypatch) -> None:
         json={
             "approval_id": approval_id,
             "reviewer_id": "reviewer-1",
-            "decision": ApprovalStatus.rejected,
+            "decision": ApprovalStatus.rejected.value,
             "feedback": "too formal",
         },
     )
     assert reject_response.status_code == 200
-    assert CLIENTS["c1"].learned_preferences[-1].rule == "Use casual, direct language for email replies"
+
+    stored_client = db.get_client("c1")
+    assert stored_client is not None
+    assert stored_client.learned_preferences[-1].rule == "Use casual, direct language for email replies"
 
 
 def test_rejected_feedback_changes_next_fallback_email_draft(monkeypatch) -> None:
@@ -308,7 +352,9 @@ def test_rejected_feedback_changes_next_fallback_email_draft(monkeypatch) -> Non
         greeting = "Hi" if client.learned_preferences else "Hello"
         return {
             "subject": f"Re: {topic.title()}",
-            "draft_body": f"{greeting} {recipient_name},\n\nFollowing up on {topic}.\n\nBest,\nAcme Executive Office",
+            "draft_body": (
+                f"{greeting} {recipient_name},\n\nFollowing up on {topic}.\n\nBest,\nAcme Executive Office"
+            ),
             "confidence": 0.8,
         }
 
@@ -350,7 +396,7 @@ def test_rejected_feedback_changes_next_fallback_email_draft(monkeypatch) -> Non
         json={
             "approval_id": approval_id,
             "reviewer_id": "reviewer-1",
-            "decision": ApprovalStatus.rejected,
+            "decision": ApprovalStatus.rejected.value,
             "feedback": "too formal",
         },
     )
@@ -371,3 +417,129 @@ def test_rejected_feedback_changes_next_fallback_email_draft(monkeypatch) -> Non
         detail["value"] for detail in revised_proposal["details"] if detail["label"] == "Draft"
     )
     assert revised_draft.startswith("Hi John,")
+
+
+def test_morning_briefing_requires_secret() -> None:
+    response = client.post("/webhooks/n8n/morning-briefing")
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid webhook secret"
+
+
+def test_morning_briefing_returns_payload_for_connected_client(monkeypatch) -> None:
+    create_client()
+    connect_google()
+
+    async def fake_generate_briefing(*args, **kwargs) -> dict:
+        return {
+            "relationship_context": "Met last week about pipeline.",
+            "open_items": ["Budget approval"],
+            "suggested_talking_points": ["Confirm launch date"],
+        }
+
+    monkeypatch.setattr(webhooks_module.calendar, "list_events", lambda client_id: {
+        "events": [
+            {
+                "id": "evt-1",
+                "title": "Partner Sync",
+                "start": "2099-01-01T15:00:00+00:00",
+                "attendees": ["partner@example.com"],
+            }
+        ]
+    })
+    monkeypatch.setattr(webhooks_module.email, "find_message_for_contact", lambda *args, **kwargs: {
+        "from": "partner@example.com",
+        "subject": "Agenda",
+        "snippet": "Here is the agenda",
+    })
+    monkeypatch.setattr(webhooks_module, "generate_briefing", fake_generate_briefing)
+
+    response = client.post(
+        "/webhooks/n8n/morning-briefing",
+        headers={"X-N8N-Secret": "test-secret"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 1
+    assert body["briefings"][0]["event_title"] == "Partner Sync"
+    assert body["briefings"][0]["open_items"] == ["Budget approval"]
+
+
+def test_pre_meeting_returns_matching_upcoming_events(monkeypatch) -> None:
+    create_client()
+    connect_google()
+
+    now = datetime.now(timezone.utc)
+    soon = (now + timedelta(minutes=30)).isoformat()
+
+    async def fake_generate_briefing(*args, **kwargs) -> dict:
+        return {
+            "relationship_context": "Warm relationship.",
+            "open_items": [],
+            "suggested_talking_points": ["Ask for decision"],
+        }
+
+    monkeypatch.setattr(webhooks_module.calendar, "list_events", lambda client_id: {
+        "events": [
+            {
+                "id": "evt-2",
+                "title": "Investor Call",
+                "start": soon,
+                "attendees": ["investor@example.com"],
+            }
+        ]
+    })
+    monkeypatch.setattr(webhooks_module.email, "find_message_for_contact", lambda *args, **kwargs: None)
+    monkeypatch.setattr(webhooks_module, "generate_briefing", fake_generate_briefing)
+
+    response = client.post(
+        "/webhooks/n8n/pre-meeting",
+        headers={"X-N8N-Secret": "test-secret"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 1
+    assert body["briefings"][0]["event_title"] == "Investor Call"
+
+
+def test_inbox_triage_returns_ranked_items(monkeypatch) -> None:
+    create_client()
+    connect_google()
+
+    async def fake_triage_inbox(*args, **kwargs):
+        from app.schemas import EmailTriageResult
+
+        return [
+            EmailTriageResult(
+                message_id="m1",
+                subject="Need approval today",
+                sender="ops@example.com",
+                date="Wed, 17 Mar 2026 10:00:00 +0000",
+                category="action_required",
+                urgency_score=4,
+                summary="Need a fast response.",
+                action_items=["Approve budget"],
+                requires_reply=True,
+            )
+        ]
+
+    monkeypatch.setattr(webhooks_module.email, "list_messages", lambda client_id: {
+        "messages": [
+            {
+                "id": "m1",
+                "from": "ops@example.com",
+                "subject": "Need approval today",
+                "snippet": "Need your response",
+            }
+        ]
+    })
+    monkeypatch.setattr(webhooks_module, "triage_inbox", fake_triage_inbox)
+
+    response = client.post(
+        "/webhooks/n8n/inbox-triage",
+        headers={"X-N8N-Secret": "test-secret"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["client_count"] == 1
+    assert body["results"][0]["urgent_count"] == 1
+    assert body["results"][0]["items"][0]["subject"] == "Need approval today"

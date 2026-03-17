@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-from app.schemas import ClientConfig, ConversationContext, EmailTriageResult
+from app.schemas import AssistantPlan, ClientConfig, ConversationContext, EmailTriageResult
 from app.settings import get_settings
 
 # ---------------------------------------------------------------------------
@@ -218,6 +218,87 @@ Client profile:
         api_key=settings.openai_api_key,
     )
     return _parse_json_response(raw or "")
+
+
+async def generate_conversation_plan(
+    client: ClientConfig,
+    context: ConversationContext | None,
+    message: str,
+) -> AssistantPlan | None:
+    settings = get_settings()
+    if not settings.openai_api_key:
+        return None
+
+    learned_prefs = ""
+    if client.learned_preferences:
+        rules = [p.rule for p in client.learned_preferences[-10:]]
+        learned_prefs = "\n".join(f"- {r}" for r in rules)
+
+    system_prompt = f"""You are the planning layer for an executive assistant.
+Your job is to decide whether the user is:
+- asking about capabilities
+- asking to read connected data
+- asking to draft a write action that must be approved before execution
+- missing a detail that requires one short follow-up
+
+Return valid JSON only with this exact shape:
+{{
+  "mode": "capability" | "read" | "write" | "clarify" | "unknown",
+  "action_type": "read_calendar" | "check_availability" | "read_email" | "draft_email_reply" | "create_event" | "reschedule_event" | "cancel_event" | null,
+  "tool_name": "calendar.list_events" | "calendar.find_availability" | "gmail.list_messages" | "gmail.get_thread" | "gmail.create_draft" | "calendar.create_event" | "calendar.update_event" | "calendar.cancel_event" | null,
+  "capability_scope": "email" | "calendar" | "general" | null,
+  "collected_fields": {{
+    "source_text": string?,
+    "recipient_name": string?,
+    "recipient_email": string?,
+    "topic": string?,
+    "draft_body": string?,
+    "contact_name": string?,
+    "requested_time": string?,
+    "title": string?,
+    "attendees": string[]?
+  }},
+  "missing_fields": string[],
+  "requires_approval": boolean,
+  "needs_google": boolean,
+  "assistant_message": string,
+  "confidence": number
+}}
+
+Rules:
+- If the user asks what you can do with email/inbox/calendar, mode="capability". Do not turn that into a tool call or a draft.
+- For read mode, choose a read action only. Do not invent any inbox or calendar data.
+- For write mode, only choose write actions that lead to a draft/proposal for approval.
+- For clarify mode, ask for only one missing detail.
+- If the user mentions replying based on an email or thread, prefer "draft_email_reply".
+- Never claim an action has been executed. Planning only.
+- Learned preferences:
+{learned_prefs or "(none yet)"}""".strip()
+
+    user_payload = {
+        "message": message,
+        "context": context.model_dump() if context else None,
+        "client": {
+            "timezone": client.timezone,
+            "working_hours": client.working_hours,
+            "priority_contacts": client.priority_contacts,
+            "focus_blocks": client.focus_blocks,
+        },
+    }
+
+    raw = await _openai_chat(
+        model=settings.openai_model,
+        system=system_prompt,
+        user=json.dumps(user_payload),
+        api_key=settings.openai_api_key,
+    )
+    parsed = _parse_json_response(raw or "")
+    if not isinstance(parsed, dict):
+        return None
+    try:
+        return AssistantPlan(**parsed)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------

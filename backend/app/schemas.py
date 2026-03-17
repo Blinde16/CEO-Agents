@@ -119,6 +119,19 @@ class ConversationContext(BaseModel):
     missing_fields: list[str] = Field(default_factory=list)
 
 
+class AssistantPlan(BaseModel):
+    mode: str  # capability / read / write / clarify / unknown
+    action_type: str | None = None
+    tool_name: str | None = None
+    capability_scope: str | None = None
+    collected_fields: dict[str, Any] = Field(default_factory=dict)
+    missing_fields: list[str] = Field(default_factory=list)
+    requires_approval: bool = False
+    needs_google: bool = False
+    assistant_message: str = ""
+    confidence: float = 0.0
+
+
 # Per-email triage result produced by LLM batch triage
 class EmailTriageResult(BaseModel):
     message_id: str
@@ -175,6 +188,7 @@ class ConversationResponse(BaseModel):
     state: str
     assistant_message: str
     context: ConversationContext
+    plan: AssistantPlan | None = None
     proposal: DraftProposal | None = None
     # Triage results when the user requests inbox review
     triage_results: list[EmailTriageResult] = Field(default_factory=list)

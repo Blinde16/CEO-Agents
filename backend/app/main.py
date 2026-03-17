@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import re
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -8,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
 from app.action_engine import UnsupportedActionError, execute_action
+from app.assistant_planner import build_assistant_plan
 from app.approval import approval_status_for_action
 from app.database import db
 from app.integrations.google import (
@@ -22,9 +24,9 @@ from app.integrations.store import set_tokens
 from app.intent_parser import parse_intent
 from app.llm import (
     extract_preference_from_feedback,
+    generate_structured_response,
     generate_briefing,
     generate_email_draft,
-    generate_structured_response,
     triage_inbox,
 )
 from app.schemas import (
@@ -35,6 +37,7 @@ from app.schemas import (
     ApprovalDecision,
     ApprovalRecord,
     ApprovalStatus,
+    AssistantPlan,
     ClientConfig,
     ConversationContext,
     ConversationRequest,
@@ -125,69 +128,8 @@ async def assistant_respond(request: ConversationRequest) -> ConversationRespons
         raise HTTPException(status_code=404, detail="client not found")
 
     context = request.context or ConversationContext()
-
-    # --- Short-circuit read-only requests ---
-    if _is_calendar_read_request(request.message):
-        return _calendar_read_response(request.client_id, request.message)
-    if _is_availability_request(request.message):
-        return _availability_response(request.client_id, request.message, client)
-    if _is_email_read_request(request.message):
-        return await _email_triage_response(request.client_id, request.message, client)
-
-    # --- LLM conversational turn (mini model) ---
-    llm_response = None
-    try:
-        llm_response = await generate_structured_response(client, context, request.message)
-    except Exception:
-        llm_response = None
-
-    if llm_response:
-        return await _response_from_llm_payload(client, context, request.message, llm_response)
-
-    # --- Deterministic fallback ---
-    parsed = parse_intent(request.message)
-    action_type = _resolve_action_type(context, parsed.intent)
-    collected_fields = {**context.collected_fields}
-    collected_fields.update(_extract_fields(action_type, request.message, client))
-    missing_fields = _missing_fields_for_action(action_type, collected_fields)
-
-    if action_type is None:
-        next_context = ConversationContext(
-            intent="unknown",
-            action_type=None,
-            collected_fields=collected_fields,
-            missing_fields=[],
-        )
-        return ConversationResponse(
-            state="needs_direction",
-            assistant_message=(
-                "I can help with email replies or calendar coordination. "
-                "Tell me who the email is for, or what meeting you want me to schedule."
-            ),
-            context=next_context,
-        )
-
-    next_context = ConversationContext(
-        intent=action_type,
-        action_type=action_type,
-        collected_fields=collected_fields,
-        missing_fields=missing_fields,
-    )
-
-    if missing_fields:
-        return ConversationResponse(
-            state="needs_clarification",
-            assistant_message=_clarification_prompt(action_type, missing_fields),
-            context=next_context,
-        )
-
-    proposal = await _build_proposal(action_type, collected_fields, client)
-    return ConversationResponse(
-        state="draft_ready",
-        assistant_message="I drafted this for you. Does this look good to you?",
-        context=next_context,
-        proposal=proposal,
-    )
+    plan = await build_assistant_plan(client, context, request.message, _extract_fields)
+    return await _response_from_plan(client, request.message, plan)
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +631,7 @@ def _extract_fields(action_type: str | None, message: str, client: ClientConfig)
         if prefix in lower:
             start = lower.index(prefix) + len(prefix)
             remainder = text[start:]
-            stop_tokens = [" about ", " for ", " tomorrow", " next week", " on ", " at ", " regarding "]
+            stop_tokens = [" about ", " for ", " tomorrow", " next week", " on ", " at ", " regarding ", " and "]
             stop_positions = [remainder.lower().find(token) for token in stop_tokens if remainder.lower().find(token) != -1]
             stop = min(stop_positions) if stop_positions else len(remainder)
             contact = remainder[:stop].strip(" .,")
@@ -717,6 +659,22 @@ def _extract_fields(action_type: str | None, message: str, client: ClientConfig)
             fields["topic"] = text[lower.index("about ") + len("about "):].strip(" .")
         elif "regarding " in lower:
             fields["topic"] = text[lower.index("regarding ") + len("regarding "):].strip(" .")
+        elif "let " in lower and " know " in lower:
+            start = lower.index("let ") + len("let ")
+            know_idx = lower.find(" know ", start)
+            if know_idx > start:
+                candidate = text[know_idx + len(" know "):].strip(" .")
+                if candidate:
+                    fields["topic"] = candidate
+        elif "that " in lower:
+            candidate = text[lower.index("that ") + len("that "):].strip(" .")
+            if candidate:
+                fields["topic"] = candidate
+
+        if "recipient_name" not in fields:
+            reply_match = re.search(r"\breply to ([A-Z][a-z]+(?: [A-Z][a-z]+)*)", text)
+            if reply_match:
+                fields["recipient_name"] = reply_match.group(1).strip()
 
         recipient = fields.get("recipient_name")
         if isinstance(recipient, str) and recipient:
@@ -746,6 +704,21 @@ def _extract_fields(action_type: str | None, message: str, client: ClientConfig)
             tail = text[lower.index("for ") + len("for "):].strip(" .")
             if tail:
                 fields["title"] = tail.title()
+
+        if "contact_name" not in fields:
+            with_match = re.search(r"\b(?:with|for) ([A-Z][a-z]+(?: [A-Z][a-z]+)*)", text)
+            if with_match:
+                fields["contact_name"] = with_match.group(1).strip()
+
+        if "title" not in fields:
+            title_match = re.search(
+                r"\b(schedule|book|move|reschedule|cancel)\s+(.+?)\s+(?:with|for|to|tomorrow|next week|this afternoon|this morning|on|at)\b",
+                lower,
+            )
+            if title_match:
+                inferred = text[title_match.start(2):title_match.end(2)].strip(" .")
+                if inferred:
+                    fields["title"] = inferred.title()
 
         contact = fields.get("contact_name")
         if isinstance(contact, str) and contact:
@@ -785,31 +758,70 @@ def _clarification_prompt(action_type: str, missing_fields: list[str]) -> str:
     return prefix + prompts.get(first_missing, "What detail should I fill in?")
 
 
-async def _response_from_llm_payload(
+def _capability_response(client: ClientConfig, plan: AssistantPlan) -> ConversationResponse:
+    connected = db.get_integration(client.client_id, "google") is not None
+    scope = plan.capability_scope or "general"
+
+    if scope == "email":
+        message = (
+            "With your email connected, I can review recent inbox messages, summarize what needs attention, "
+            "pull thread context for a sender, and draft replies for your approval before anything is sent."
+        )
+        if not connected:
+            message = "Connect Google and I can review inbox messages, pull thread context, and draft email replies for approval."
+    elif scope == "calendar":
+        message = (
+            "With your calendar connected, I can read upcoming meetings, find open time, prepare meeting briefs, "
+            "and draft calendar changes for your approval before placing them."
+        )
+        if not connected:
+            message = "Connect Google and I can read your calendar, find open time, and prepare calendar changes for approval."
+    else:
+        message = (
+            "I can review inbox and calendar data from Google, summarize what matters, draft replies, "
+            "and prepare calendar actions for your approval before execution."
+        )
+
+    return ConversationResponse(
+        state="capability_explained",
+        assistant_message=message,
+        context=ConversationContext(intent="capability", action_type=None, collected_fields={}, missing_fields=[]),
+        plan=plan,
+    )
+
+
+async def _response_from_plan(
     client: ClientConfig,
-    context: ConversationContext,
     message: str,
-    llm_payload: dict,
+    plan: AssistantPlan,
 ) -> ConversationResponse:
-    action_type = _resolve_action_type(context, str(llm_payload.get("action_type") or ""))
+    if plan.mode == "capability":
+        return _capability_response(client, plan)
+
+    action_type = plan.action_type
 
     if action_type == "read_calendar":
-        return _calendar_read_response(client.client_id, message)
+        response = _calendar_read_response(client.client_id, message)
+        response.plan = plan
+        return response
     if action_type == "check_availability":
-        return _availability_response(client.client_id, message, client)
+        response = _availability_response(client.client_id, message, client)
+        response.plan = plan
+        return response
     if action_type == "read_email":
-        return await _email_triage_response(client.client_id, message, client)
+        response = await _email_triage_response(client.client_id, message, client)
+        response.plan = plan
+        return response
 
-    collected_fields = {**context.collected_fields}
-    llm_fields = llm_payload.get("collected_fields", {})
-    if isinstance(llm_fields, dict):
-        collected_fields.update(llm_fields)
+    collected_fields = {**plan.collected_fields}
     collected_fields.setdefault("source_text", message)
 
     if action_type == "draft_email_reply":
         recipient = str(collected_fields.get("recipient_name", ""))
-        if recipient and ("@" not in str(collected_fields.get("recipient_email", ""))
-                         or "example.com" in str(collected_fields.get("recipient_email", ""))):
+        if recipient and (
+            "@" not in str(collected_fields.get("recipient_email", ""))
+            or "example.com" in str(collected_fields.get("recipient_email", ""))
+        ):
             resolved = email.resolve_contact_email(client.client_id, recipient)
             if resolved:
                 collected_fields["recipient_email"] = resolved
@@ -825,9 +837,7 @@ async def _response_from_llm_payload(
                 collected_fields["source_message_from"] = str(inbox_msg.get("from", ""))
                 collected_fields["source_message_subject"] = str(inbox_msg.get("subject", ""))
 
-    missing_fields = [
-        field for field in llm_payload.get("missing_fields", []) if isinstance(field, str)
-    ] or _missing_fields_for_action(action_type, collected_fields)
+    missing_fields = plan.missing_fields or _missing_fields_for_action(action_type, collected_fields)
 
     next_context = ConversationContext(
         intent=action_type or "unknown",
@@ -839,26 +849,25 @@ async def _response_from_llm_payload(
     if action_type is None:
         return ConversationResponse(
             state="needs_direction",
-            assistant_message=str(
-                llm_payload.get("assistant_message") or "I can help with email replies or calendar coordination."
-            ),
+            assistant_message=plan.assistant_message or "I can help with email replies or calendar coordination.",
             context=next_context,
+            plan=plan,
         )
 
     if missing_fields:
         return ConversationResponse(
             state="needs_clarification",
-            assistant_message=str(
-                llm_payload.get("assistant_message") or _clarification_prompt(action_type, missing_fields)
-            ),
+            assistant_message=plan.assistant_message or _clarification_prompt(action_type, missing_fields),
             context=next_context,
+            plan=plan.model_copy(update={"collected_fields": collected_fields, "missing_fields": missing_fields}),
         )
 
     proposal = await _build_proposal(action_type, collected_fields, client)
     return ConversationResponse(
         state="draft_ready",
-        assistant_message=str(llm_payload.get("assistant_message") or "I drafted this for you. Does this look good?"),
+        assistant_message=plan.assistant_message or "I drafted this for you. Does this look good?",
         context=next_context,
+        plan=plan.model_copy(update={"collected_fields": collected_fields, "missing_fields": []}),
         proposal=proposal,
     )
 

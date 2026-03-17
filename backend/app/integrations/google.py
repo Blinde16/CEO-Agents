@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+import os
 import quopri
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
+from dotenv import dotenv_values
 
 from app.settings import get_settings
 
@@ -24,15 +27,37 @@ class GoogleIntegrationConfigError(ValueError):
     pass
 
 
-def build_auth_url(client_id: str, state: str) -> str:
+ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+
+
+def _config_value(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is not None and value.strip():
+        return value.strip()
+    fallback = dotenv_values(ENV_FILE).get(name)
+    if fallback is None:
+        return None
+    fallback = str(fallback).strip()
+    return fallback or None
+
+
+def _google_oauth_config() -> tuple[str | None, str | None, str]:
     settings = get_settings()
-    if not settings.google_client_id:
+    client_id = _config_value("GOOGLE_CLIENT_ID") or settings.google_client_id
+    client_secret = _config_value("GOOGLE_CLIENT_SECRET") or settings.google_client_secret
+    redirect_uri = _config_value("GOOGLE_REDIRECT_URI") or settings.google_redirect_uri
+    return client_id, client_secret, redirect_uri
+
+
+def build_auth_url(client_id: str, state: str) -> str:
+    google_client_id, _, redirect_uri = _google_oauth_config()
+    if not google_client_id:
         raise GoogleIntegrationConfigError("GOOGLE_CLIENT_ID is not configured")
 
     query = urlencode(
         {
-            "client_id": settings.google_client_id,
-            "redirect_uri": settings.google_redirect_uri,
+            "client_id": google_client_id,
+            "redirect_uri": redirect_uri,
             "response_type": "code",
             "access_type": "offline",
             "prompt": "consent",
@@ -45,8 +70,8 @@ def build_auth_url(client_id: str, state: str) -> str:
 
 
 async def exchange_code_for_tokens(code: str) -> dict:
-    settings = get_settings()
-    if not settings.google_client_id or not settings.google_client_secret:
+    google_client_id, google_client_secret, redirect_uri = _google_oauth_config()
+    if not google_client_id or not google_client_secret:
         raise GoogleIntegrationConfigError("Google OAuth credentials are not fully configured")
 
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -54,9 +79,9 @@ async def exchange_code_for_tokens(code: str) -> dict:
             "https://oauth2.googleapis.com/token",
             data={
                 "code": code,
-                "client_id": settings.google_client_id,
-                "client_secret": settings.google_client_secret,
-                "redirect_uri": settings.google_redirect_uri,
+                "client_id": google_client_id,
+                "client_secret": google_client_secret,
+                "redirect_uri": redirect_uri,
                 "grant_type": "authorization_code",
             },
         )
@@ -75,16 +100,16 @@ async def fetch_user_info(access_token: str) -> dict:
 
 
 def refresh_access_token(refresh_token: str) -> dict:
-    settings = get_settings()
-    if not settings.google_client_id or not settings.google_client_secret:
+    google_client_id, google_client_secret, _ = _google_oauth_config()
+    if not google_client_id or not google_client_secret:
         raise GoogleIntegrationConfigError("Google OAuth credentials are not fully configured")
 
     with httpx.Client(timeout=20.0) as client:
         response = client.post(
             "https://oauth2.googleapis.com/token",
             data={
-                "client_id": settings.google_client_id,
-                "client_secret": settings.google_client_secret,
+                "client_id": google_client_id,
+                "client_secret": google_client_secret,
                 "refresh_token": refresh_token,
                 "grant_type": "refresh_token",
             },
