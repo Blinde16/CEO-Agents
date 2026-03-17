@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import anthropic
+import httpx
 
 from app.schemas import ClientConfig, ConversationContext, EmailTriageResult
 from app.settings import get_settings
@@ -12,19 +12,31 @@ from app.settings import get_settings
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-async def _claude_chat(model: str, system: str, user: str, api_key: str) -> str | None:
-    """Call the Anthropic Messages API and return the first text content block."""
-    client = anthropic.AsyncAnthropic(api_key=api_key)
-    message = await client.messages.create(
-        model=model,
-        max_tokens=2048,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    if not message.content:
+async def _openai_chat(model: str, system: str, user: str, api_key: str) -> str | None:
+    """Call the OpenAI chat completions endpoint and return the first message text."""
+    async with httpx.AsyncClient(timeout=45.0) as http_client:
+        response = await http_client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.3,
+            },
+        )
+        response.raise_for_status()
+        body = response.json()
+
+    choices = body.get("choices", [])
+    if not choices:
         return None
-    first = message.content[0]
-    return first.text.strip() if hasattr(first, "text") else None
+    return choices[0].get("message", {}).get("content", "").strip() or None
 
 
 def _parse_json_response(raw: str) -> dict | None:
@@ -128,7 +140,7 @@ def _build_fallback_email_draft(
 
 
 # ---------------------------------------------------------------------------
-# 1. Conversational turn — used by /assistant/respond (fast model)
+# 1. Conversational turn — used by /assistant/respond (mini model)
 # ---------------------------------------------------------------------------
 
 async def generate_structured_response(
@@ -137,7 +149,7 @@ async def generate_structured_response(
     message: str,
 ) -> dict | None:
     settings = get_settings()
-    if not settings.anthropic_api_key:
+    if not settings.openai_api_key:
         return None
 
     learned_prefs = ""
@@ -199,17 +211,17 @@ Client profile:
         "approval_rules": client.approval_rules,
     }
 
-    raw = await _claude_chat(
-        model=settings.claude_model,  # haiku — fast, cheap
+    raw = await _openai_chat(
+        model=settings.openai_model,  # gpt-4.1-mini — fast, cheap
         system=system_prompt,
         user=json.dumps(user_payload),
-        api_key=settings.anthropic_api_key,
+        api_key=settings.openai_api_key,
     )
     return _parse_json_response(raw or "")
 
 
 # ---------------------------------------------------------------------------
-# 2. Email triage — batch triage N emails in one call (fast model)
+# 2. Email triage — batch triage N emails in one call (mini model)
 # ---------------------------------------------------------------------------
 
 async def triage_inbox(
@@ -222,7 +234,7 @@ async def triage_inbox(
     Returns a list of EmailTriageResult sorted by urgency descending.
     """
     settings = get_settings()
-    if not settings.anthropic_api_key or not messages:
+    if not settings.openai_api_key or not messages:
         return []
 
     system_prompt = f"""You are an executive assistant triage system for {client.display_name or client.client_id}.
@@ -248,7 +260,6 @@ Each object must have:
 Priority contacts (treat with elevated urgency): {", ".join(client.priority_contacts) or "none"}
 Executive timezone: {client.timezone}""".strip()
 
-    # Format messages compactly for the prompt
     messages_payload = [
         {
             "id": m.get("id"),
@@ -260,17 +271,16 @@ Executive timezone: {client.timezone}""".strip()
         for m in messages
     ]
 
-    raw = await _claude_chat(
-        model=settings.claude_model,  # haiku — cheap, fast for triage
+    raw = await _openai_chat(
+        model=settings.openai_model,  # gpt-4.1-mini — cheap, fast for triage
         system=system_prompt,
         user=json.dumps(messages_payload),
-        api_key=settings.anthropic_api_key,
+        api_key=settings.openai_api_key,
     )
     if not raw:
         return []
 
     raw = raw.strip()
-    # Extract JSON array
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -325,10 +335,10 @@ async def generate_email_draft(
 ) -> dict[str, Any]:
     """
     Generate a polished, thread-aware email draft in the executive's voice.
-    Uses claude-sonnet for quality. Returns {draft_body, subject, confidence}.
+    Uses gpt-4.1 for quality. Returns {draft_body, subject, confidence}.
     """
     settings = get_settings()
-    if not settings.anthropic_api_key:
+    if not settings.openai_api_key:
         return _build_fallback_email_draft(client, recipient_name, topic, thread_messages, user_instruction)
 
     voice_section = ""
@@ -375,11 +385,11 @@ Rules:
         "client_name": client.display_name or client.client_id,
     }
 
-    raw = await _claude_chat(
-        model=settings.claude_model_heavy,  # sonnet — quality matters for drafts
+    raw = await _openai_chat(
+        model=settings.openai_model_heavy,  # gpt-4.1 — quality matters for drafts
         system=system_prompt,
         user=json.dumps(user_payload),
-        api_key=settings.anthropic_api_key,
+        api_key=settings.openai_api_key,
     )
     result = _parse_json_response(raw or "")
     if not result:
@@ -401,9 +411,9 @@ async def generate_briefing(
     Returns {relationship_context, open_items, suggested_talking_points}.
     """
     settings = get_settings()
-    if not settings.anthropic_api_key:
+    if not settings.openai_api_key:
         return {
-            "relationship_context": "No LLM configured — set ANTHROPIC_API_KEY to enable briefings.",
+            "relationship_context": "No LLM configured — set OPENAI_API_KEY to enable briefings.",
             "open_items": [],
             "suggested_talking_points": [],
         }
@@ -431,11 +441,11 @@ Return JSON only:
         "executive_name": client.display_name or client.client_id,
     }
 
-    raw = await _claude_chat(
-        model=settings.claude_model_heavy,  # sonnet — briefings need quality
+    raw = await _openai_chat(
+        model=settings.openai_model_heavy,  # gpt-4.1 — briefings need quality
         system=system_prompt,
         user=json.dumps(user_payload),
-        api_key=settings.anthropic_api_key,
+        api_key=settings.openai_api_key,
     )
     result = _parse_json_response(raw or "")
     if not result:
@@ -448,7 +458,7 @@ Return JSON only:
 
 
 # ---------------------------------------------------------------------------
-# 5. Preference extraction from rejection feedback (fast model)
+# 5. Preference extraction from rejection feedback (mini model)
 # ---------------------------------------------------------------------------
 
 async def extract_preference_from_feedback(
@@ -462,7 +472,7 @@ async def extract_preference_from_feedback(
     Returns a single preference string or None if not extractable.
     """
     settings = get_settings()
-    if not settings.anthropic_api_key or not feedback.strip():
+    if not settings.openai_api_key or not feedback.strip():
         return _fallback_preference_rule(action_type, feedback)
 
     system_prompt = """Extract a concise, reusable preference rule from the executive's feedback about a rejected draft.
@@ -479,11 +489,11 @@ Examples:
         "executive_feedback": feedback,
     }
 
-    raw = await _claude_chat(
-        model=settings.claude_model,  # haiku is fine for this simple extraction
+    raw = await _openai_chat(
+        model=settings.openai_model,  # mini is fine for this simple extraction
         system=system_prompt,
         user=json.dumps(user_payload),
-        api_key=settings.anthropic_api_key,
+        api_key=settings.openai_api_key,
     )
     result = _parse_json_response(raw or "")
     if not result:
