@@ -235,6 +235,54 @@ async def get_meeting_briefing(client_id: str, event_id: str) -> MeetingBriefing
     )
 
 
+@app.get("/briefing/next", response_model=MeetingBriefing)
+async def get_next_meeting_briefing(client_id: str) -> MeetingBriefing:
+    """
+    Demo endpoint: automatically find the next upcoming calendar event and
+    generate a full meeting prep brief — no event_id required.
+    This is the centerpiece of the demo: shows proactive AI-driven briefing.
+    """
+    client = CLIENTS.get(client_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="client not found")
+
+    if not INTEGRATIONS.get(client_id, {}).get("google"):
+        raise HTTPException(status_code=400, detail="Google not connected")
+
+    events_result = calendar.list_events(client_id)
+    upcoming = [e for e in events_result.get("events", []) if e.get("start")]
+    if not upcoming:
+        raise HTTPException(status_code=404, detail="no upcoming events found")
+
+    # Pick the soonest event
+    event = upcoming[0]
+    event_id = event.get("id", "next")
+    attendee_emails = [a for a in event.get("attendees", []) if a]
+
+    recent_emails: list[dict] = []
+    for attendee_email in attendee_emails[:3]:
+        name_hint = attendee_email.split("@")[0].replace(".", " ")
+        msg = email.find_message_for_contact(client_id, name_hint)
+        if msg:
+            recent_emails.append(msg)
+
+    briefing_data = await generate_briefing(client, event, recent_emails)
+
+    return MeetingBriefing(
+        event_id=event_id,
+        event_title=event.get("title", "Meeting"),
+        start_time=str(event.get("start", "")),
+        attendees=attendee_emails,
+        relationship_context=briefing_data.get("relationship_context", ""),
+        open_items=briefing_data.get("open_items", []),
+        suggested_talking_points=briefing_data.get("suggested_talking_points", []),
+        recent_emails=[
+            {"from": e.get("from", ""), "subject": e.get("subject", ""), "snippet": e.get("snippet", "")}
+            for e in recent_emails
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Integrations
 # ---------------------------------------------------------------------------

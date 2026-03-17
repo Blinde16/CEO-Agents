@@ -13,11 +13,11 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 @dataclass(frozen=True)
 class Settings:
-    openai_api_key: str | None
-    # Fast/cheap model for reads, triage, simple ops (gpt-4.1-mini)
-    openai_model: str
-    # Smart model for drafts, briefings, complex reasoning (gpt-4.1)
-    openai_model_heavy: str
+    anthropic_api_key: str | None
+    # Fast/cheap model for reads, triage, simple ops
+    claude_model: str
+    # Smart model for drafts, briefings, complex reasoning
+    claude_model_heavy: str
     google_client_id: str | None
     google_client_secret: str | None
     google_redirect_uri: str
@@ -27,9 +27,9 @@ class Settings:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings(
-        openai_api_key=os.getenv("OPENAI_API_KEY"),
-        openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-        openai_model_heavy=os.getenv("OPENAI_MODEL_HEAVY", "gpt-4.1"),
+        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+        claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
+        claude_model_heavy=os.getenv("CLAUDE_MODEL_HEAVY", "claude-sonnet-4-6"),
         google_client_id=os.getenv("GOOGLE_CLIENT_ID"),
         google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
         google_redirect_uri=os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/integrations/google/callback"),
