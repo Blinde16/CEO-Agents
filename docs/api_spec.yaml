@@ -1,0 +1,37 @@
+openapi: 3.0.3
+info:
+  title: CEO-Agents API
+  version: 1.0.0
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+  /clients:
+    post:
+      summary: Create or update a tenant config
+  /clients/{client_id}:
+    get:
+      summary: Get tenant config
+      parameters:
+        - in: path
+          name: client_id
+          required: true
+          schema: { type: string }
+  /intent/parse:
+    post:
+      summary: Parse natural language into structured intent
+  /actions:
+    post:
+      summary: Queue or execute deterministic action
+  /approvals:
+    get:
+      summary: List pending/completed approvals
+  /approvals/decision:
+    post:
+      summary: Approve or reject an action
+  /logs:
+    get:
+      summary: Query action logs for audit/admin
