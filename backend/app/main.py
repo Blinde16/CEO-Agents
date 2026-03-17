@@ -26,6 +26,12 @@ ACTIONS: dict[str, ActionRecord] = {}
 ACTION_LOGS: list[ActionLog] = []
 APPROVAL_QUEUE: dict[str, dict] = {}
 
+FINAL_APPROVAL_STATES = {
+    ApprovalStatus.approved,
+    ApprovalStatus.rejected,
+    ApprovalStatus.expired,
+}
+
 
 @app.get("/health")
 def health() -> dict:
@@ -98,8 +104,17 @@ def decide_approval(decision: ApprovalDecision) -> dict:
     if not approval:
         raise HTTPException(status_code=404, detail="approval not found")
 
-    if decision.decision not in {ApprovalStatus.approved, ApprovalStatus.rejected, ApprovalStatus.expired}:
+    if decision.decision not in FINAL_APPROVAL_STATES:
         raise HTTPException(status_code=400, detail="invalid decision")
+
+    current_status = approval["status"]
+
+    # Idempotent replay: return existing finalized state unchanged.
+    if current_status in FINAL_APPROVAL_STATES and current_status == decision.decision:
+        return approval
+
+    if current_status in FINAL_APPROVAL_STATES and current_status != decision.decision:
+        raise HTTPException(status_code=409, detail="approval already finalized")
 
     approval["status"] = decision.decision
     approval["reviewer_id"] = decision.reviewer_id
